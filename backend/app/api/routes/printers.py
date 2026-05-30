@@ -43,6 +43,7 @@ from backend.app.services.bambu_ftp import (
 from backend.app.services.printer_diagnostic import run_connection_diagnostic
 from backend.app.services.printer_manager import (
     get_derived_status_name,
+    is_bed_slinger,
     printer_manager,
     resolve_plate_id,
     supports_chamber_temp,
@@ -2784,6 +2785,158 @@ async def set_chamber_light(
     return {"success": True, "message": f"Chamber light {'on' if on else 'off'}"}
 
 
+DEFAULT_MAX_AXIS_JOG_DISTANCE_MM = 200
+PRINTER_AXIS_TRAVEL_MM = {
+    "A1MINI": {"X": 180, "Y": 180, "Z": 180},
+    "A12": {"X": 180, "Y": 180, "Z": 180},
+    "A04": {"X": 180, "Y": 180, "Z": 180},
+    # These legacy identifiers are inconsistent across upstream payloads.
+    # The A1 Mini envelope is the conservative safe cap for either variant.
+    "N1": {"X": 180, "Y": 180, "Z": 180},
+    "N2S": {"X": 180, "Y": 180, "Z": 180},
+    "A1": {"X": 256, "Y": 256, "Z": 256},
+    "A11": {"X": 256, "Y": 256, "Z": 256},
+    "X1": {"X": 256, "Y": 256, "Z": 256},
+    "X1C": {"X": 256, "Y": 256, "Z": 256},
+    "X1E": {"X": 256, "Y": 256, "Z": 256},
+    "C11": {"X": 256, "Y": 256, "Z": 256},
+    "C12": {"X": 256, "Y": 256, "Z": 256},
+    "C13": {"X": 256, "Y": 256, "Z": 256},
+    "P1": {"X": 256, "Y": 256, "Z": 256},
+    "P1P": {"X": 256, "Y": 256, "Z": 256},
+    "P1S": {"X": 256, "Y": 256, "Z": 256},
+    "P2S": {"X": 256, "Y": 256, "Z": 256},
+    "H2D": {"X": 325, "Y": 320, "Z": 325},
+    "H2DPRO": {"X": 325, "Y": 320, "Z": 325},
+    "O1D": {"X": 325, "Y": 320, "Z": 325},
+    "O1E": {"X": 325, "Y": 320, "Z": 325},
+    "O2D": {"X": 325, "Y": 320, "Z": 325},
+    "H2C": {"X": 305, "Y": 320, "Z": 325},
+    "O1C": {"X": 305, "Y": 320, "Z": 325},
+    "O1C2": {"X": 305, "Y": 320, "Z": 325},
+    "H2S": {"X": 340, "Y": 320, "Z": 340},
+    "O1S": {"X": 340, "Y": 320, "Z": 340},
+    "X2D": {"X": 256, "Y": 256, "Z": 260},
+    "N6": {"X": 256, "Y": 256, "Z": 260},
+}
+AXIS_JOG_DEFAULT_FEEDRATES = {"X": 3000, "Y": 3000, "Z": 600}
+AXIS_JOG_FEEDRATE_LIMITS = {
+    "X": (300, 12000),
+    "Y": (300, 12000),
+    "Z": (60, 1200),
+}
+MAX_EXTRUDE_DISTANCE_MM = 100
+DEFAULT_EXTRUDE_FEEDRATE = 300
+MIN_EXTRUDE_FEEDRATE = 30
+MAX_EXTRUDE_FEEDRATE = 900
+DEFAULT_EXTRUDE_MIN_TEMP_C = 170
+TEMPERATURE_TARGET_LIMITS_C = {
+    "nozzle": (0, 320),
+    "bed": (0, 120),
+    "chamber": (0, 70),
+}
+
+
+def _axis_travel_mm(printer_model: str | None, axis: str) -> float:
+    normalized_model = re.sub(r"[\s-]+", "", (printer_model or "").upper())
+    return PRINTER_AXIS_TRAVEL_MM.get(normalized_model, {}).get(axis.upper(), DEFAULT_MAX_AXIS_JOG_DISTANCE_MM)
+
+
+@router.post("/{printer_id}/temperature")
+async def set_temperature(
+    printer_id: int,
+    target: str = Query(..., description="Heater target: 'nozzle', 'bed', or 'chamber'"),
+    temperature: int = Query(..., description="Target temperature in Celsius; 0 turns the heater off"),
+    nozzle: int = Query(0, description="Nozzle index for dual-nozzle printers"),
+    _=RequirePermissionIfAuthEnabled(Permission.PRINTERS_CONTROL),
+    db: AsyncSession = Depends(get_db),
+):
+    """Set a heater target temperature."""
+    target = target.lower()
+    if target not in TEMPERATURE_TARGET_LIMITS_C:
+        raise HTTPException(400, "target must be 'nozzle', 'bed', or 'chamber'")
+    min_temp, max_temp = TEMPERATURE_TARGET_LIMITS_C[target]
+    if temperature < min_temp or temperature > max_temp:
+        raise HTTPException(400, f"{target} temperature must be between {min_temp} and {max_temp} C")
+    if nozzle < 0 or nozzle > 1:
+        raise HTTPException(400, "nozzle must be 0 or 1")
+
+    result = await db.execute(select(Printer).where(Printer.id == printer_id))
+    printer = result.scalar_one_or_none()
+    if not printer:
+        raise HTTPException(404, "Printer not found")
+    if target == "chamber" and not supports_chamber_temp(printer.model):
+        raise HTTPException(400, "Chamber temperature control is not supported by this printer model")
+
+    client = printer_manager.get_client(printer_id)
+    if not client:
+        raise HTTPException(400, "Printer not connected")
+
+    if target == "nozzle":
+        success = client.set_nozzle_temperature(temperature, nozzle)
+    elif target == "bed":
+        success = client.set_bed_temperature(temperature)
+    else:
+        success = client.set_chamber_temperature(temperature)
+    if not success:
+        raise HTTPException(500, "Failed to set temperature")
+
+    return {"success": True, "message": f"{target.capitalize()} temperature set to {temperature} C"}
+
+
+def _axis_jog_feedrate(axis: str, speed: int | None) -> int:
+    axis = axis.upper()
+    if axis not in AXIS_JOG_DEFAULT_FEEDRATES:
+        raise ValueError("axis must be 'x', 'y', or 'z'")
+
+    feedrate = AXIS_JOG_DEFAULT_FEEDRATES[axis] if speed is None else speed
+    min_feedrate, max_feedrate = AXIS_JOG_FEEDRATE_LIMITS[axis]
+    if feedrate < min_feedrate or feedrate > max_feedrate:
+        raise HTTPException(400, f"{axis} speed must be between {min_feedrate} and {max_feedrate} mm/min")
+    return feedrate
+
+
+def _axis_jog_gcode(
+    axis: str,
+    distance: float,
+    printer_model: str | None,
+    force: bool,
+    feedrate: int | None = None,
+) -> str:
+    """Build a relative jog command for a printer axis.
+
+    X/Y use raw coordinate-space movement. Z keeps the existing bed-jog
+    contract: the signed distance is a nozzle-bed gap adjustment, translated
+    per printer kinematics so the UI stays model-safe.
+    """
+    axis = axis.upper()
+    if axis not in ("X", "Y", "Z"):
+        raise ValueError("axis must be 'x', 'y', or 'z'")
+
+    gcode_distance = -distance if axis == "Z" and is_bed_slinger(printer_model) else distance
+    feedrate = _axis_jog_feedrate(axis, feedrate)
+
+    lines = []
+    if force:
+        lines.append("M211 S0")
+    lines += ["G91", f"G1 {axis}{gcode_distance:.2f} F{feedrate}", "G90"]
+    if force:
+        lines.append("M211 S1")
+    return "\n".join(lines)
+
+
+def _extrude_gcode(amount: float, speed: int) -> str:
+    return "\n".join(["M83", f"G1 E{amount:.2f} F{speed}", "M82"])
+
+
+def _active_nozzle_temperature(state) -> float | None:
+    temperatures = getattr(state, "temperatures", None) or {}
+    active_extruder = getattr(state, "active_extruder", None)
+    key = "nozzle_2" if active_extruder == 0 and "nozzle_2" in temperatures else "nozzle"
+    value = temperatures.get(key)
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
 @router.post("/{printer_id}/bed-jog")
 async def bed_jog(
     printer_id: int,
@@ -2816,8 +2969,83 @@ async def bed_jog(
     the sign before emitting the G-code, so the UI semantics stay the
     same regardless of which part physically moves.
     """
-    if distance == 0 or abs(distance) > 200:
-        raise HTTPException(400, "Distance must be non-zero and ≤ 200 mm")
+    result = await db.execute(select(Printer).where(Printer.id == printer_id))
+    printer = result.scalar_one_or_none()
+    if not printer:
+        raise HTTPException(404, "Printer not found")
+    max_distance = _axis_travel_mm(printer.model, "z")
+    if distance == 0 or abs(distance) > max_distance:
+        raise HTTPException(400, f"Distance must be non-zero and <= {max_distance:g} mm")
+
+    client = printer_manager.get_client(printer_id)
+    if not client:
+        raise HTTPException(400, "Printer not connected")
+
+    if not client.send_gcode(_axis_jog_gcode("z", distance, printer.model, force)):
+        raise HTTPException(500, "Failed to send bed-jog command")
+
+    return {"success": True, "message": f"Bed jog {distance:+.1f} mm sent"}
+
+
+@router.post("/{printer_id}/axis-jog")
+async def axis_jog(
+    printer_id: int,
+    axis: str = Query(..., description="Axis to jog: 'x', 'y', or 'z'"),
+    distance: float = Query(..., description="Signed relative jog distance in millimeters"),
+    force: bool = Query(False, description="If true, bypass soft endstops via M211 for this move"),
+    speed: int | None = Query(None, description="Optional move feedrate in mm/min"),
+    limit: float | None = Query(None, description="Maximum allowed absolute distance for this move"),
+    _=RequirePermissionIfAuthEnabled(Permission.PRINTERS_CONTROL),
+    db: AsyncSession = Depends(get_db),
+):
+    """Jog an axis by a relative distance.
+
+    X/Y are raw coordinate-space moves. Z intentionally shares the bed-jog
+    safety semantics because Bambu's bed-on-Z and bed-slinger models move
+    different hardware for the same nozzle-bed gap change.
+    """
+    axis = axis.lower()
+    if axis not in ("x", "y", "z"):
+        raise HTTPException(400, "axis must be 'x', 'y', or 'z'")
+    result = await db.execute(select(Printer).where(Printer.id == printer_id))
+    printer = result.scalar_one_or_none()
+    if not printer:
+        raise HTTPException(404, "Printer not found")
+    max_distance = _axis_travel_mm(printer.model, axis)
+    effective_limit = max_distance if limit is None else limit
+    if effective_limit <= 0 or effective_limit > max_distance:
+        raise HTTPException(400, f"Motion limit must be > 0 and <= {max_distance:g} mm")
+    if distance == 0 or abs(distance) > effective_limit:
+        raise HTTPException(400, f"Distance must be non-zero and <= {effective_limit:g} mm")
+    feedrate = _axis_jog_feedrate(axis, speed)
+
+    client = printer_manager.get_client(printer_id)
+    if not client:
+        raise HTTPException(400, "Printer not connected")
+
+    if not client.send_gcode(_axis_jog_gcode(axis, distance, printer.model, force, feedrate)):
+        raise HTTPException(500, "Failed to send axis-jog command")
+
+    return {"success": True, "message": f"{axis.upper()} jog {distance:+.1f} mm sent"}
+
+
+@router.post("/{printer_id}/extrude")
+async def extrude(
+    printer_id: int,
+    amount: float = Query(..., description="Signed relative extrusion amount in millimeters"),
+    speed: int = Query(DEFAULT_EXTRUDE_FEEDRATE, description="Extruder feedrate in mm/min"),
+    force: bool = Query(False, description="If true, allow extrusion below the minimum nozzle temperature"),
+    min_temp: int = Query(DEFAULT_EXTRUDE_MIN_TEMP_C, description="Minimum nozzle temperature in Celsius"),
+    _=RequirePermissionIfAuthEnabled(Permission.PRINTERS_CONTROL),
+    db: AsyncSession = Depends(get_db),
+):
+    """Extrude or retract filament by a relative amount."""
+    if amount == 0 or abs(amount) > MAX_EXTRUDE_DISTANCE_MM:
+        raise HTTPException(400, "Amount must be non-zero and <= 100 mm")
+    if speed < MIN_EXTRUDE_FEEDRATE or speed > MAX_EXTRUDE_FEEDRATE:
+        raise HTTPException(400, "Extrusion speed must be between 30 and 900 mm/min")
+    if min_temp < 0 or min_temp > 300:
+        raise HTTPException(400, "Minimum temperature must be between 0 and 300 C")
 
     result = await db.execute(select(Printer).where(Printer.id == printer_id))
     printer = result.scalar_one_or_none()
@@ -2828,21 +3056,15 @@ async def bed_jog(
     if not client:
         raise HTTPException(400, "Printer not connected")
 
-    from backend.app.services.printer_manager import is_bed_slinger
+    nozzle_temp = _active_nozzle_temperature(printer_manager.get_status(printer_id))
+    if not force and (nozzle_temp is None or nozzle_temp < min_temp):
+        raise HTTPException(400, f"Nozzle must be at least {min_temp} C before extrusion")
 
-    gcode_distance = -distance if is_bed_slinger(printer.model) else distance
+    if not client.send_gcode(_extrude_gcode(amount, speed)):
+        raise HTTPException(500, "Failed to send extrusion command")
 
-    lines = []
-    if force:
-        lines.append("M211 S0")
-    lines += ["G91", f"G1 Z{gcode_distance:.2f} F600", "G90"]
-    if force:
-        lines.append("M211 S1")
-
-    if not client.send_gcode("\n".join(lines)):
-        raise HTTPException(500, "Failed to send bed-jog command")
-
-    return {"success": True, "message": f"Bed jog {distance:+.1f} mm sent"}
+    action = "Extrude" if amount > 0 else "Retract"
+    return {"success": True, "message": f"{action} {abs(amount):.1f} mm sent"}
 
 
 @router.post("/{printer_id}/home-axes")

@@ -8,6 +8,7 @@ interface CollapsibleProps {
   defaultOpen?: boolean;
   className?: string;
   summaryClassName?: string;
+  ariaLabel?: string;
   /** When provided, the component is controlled — parent owns the open state. */
   open?: boolean;
   /** Called when the user clicks the toggle. Use with `open` for controlled mode. */
@@ -30,6 +31,7 @@ export function Collapsible({
   defaultOpen = false,
   className = '',
   summaryClassName = '',
+  ariaLabel,
   open: controlledOpen,
   onToggle,
 }: CollapsibleProps) {
@@ -47,6 +49,7 @@ export function Collapsible({
     <div className={className}>
       <div
         role="button"
+        aria-label={ariaLabel}
         tabIndex={0}
         onClick={handleToggle}
         onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); handleToggle(); } }}

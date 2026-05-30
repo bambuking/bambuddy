@@ -71,6 +71,7 @@ const selectToolbarDropdownOption = async (triggerName: RegExp, optionName: RegE
 describe('PrintersPage', () => {
   beforeEach(() => {
     localStorage.removeItem('printerCardSize');
+    sessionStorage.clear();
 
     server.use(
       http.get('/api/v1/printers/', () => {
@@ -211,6 +212,212 @@ describe('PrintersPage', () => {
       // There should be some interactive elements for printer actions
       const buttons = screen.getAllByRole('button');
       expect(buttons.length).toBeGreaterThan(0);
+    });
+
+    it('renders an integrated jog cross on expanded printer cards', async () => {
+      const user = userEvent.setup();
+      render(<PrintersPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('X1 Carbon')).toBeInTheDocument();
+      });
+
+      expect((await screen.findAllByText('Jog')).length).toBeGreaterThan(0);
+      expect(screen.queryByRole('button', { name: /Move X\+ X1 Carbon/i })).not.toBeInTheDocument();
+      await user.click(screen.getByRole('button', { name: /Jog X1 Carbon/i }));
+      expect(screen.getByRole('button', { name: /Move X\+ X1 Carbon/i })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Move Y- X1 Carbon/i })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Auto Home X1 Carbon/i })).toBeInTheDocument();
+      expect(screen.getByLabelText(/XY jog speed X1 Carbon/i)).toBeInTheDocument();
+      const temperatureToggle = screen.getByRole('button', { name: /Temperature X1 Carbon/i });
+      expect(temperatureToggle).toHaveTextContent('N 25°C');
+      expect(temperatureToggle).toHaveTextContent('B 25°C');
+      await user.click(temperatureToggle);
+      expect(screen.queryByText('Set targets')).not.toBeInTheDocument();
+      expect(screen.getByLabelText(/Nozzle target X1 Carbon/i)).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Set nozzle temperature X1 Carbon/i })).toBeInTheDocument();
+      const extrusionToggle = screen.getByRole('button', { name: /Extrusion X1 Carbon/i });
+      expect(extrusionToggle).not.toHaveTextContent('25°C');
+      await user.click(extrusionToggle);
+      expect(screen.queryByText('Filament move')).not.toBeInTheDocument();
+      expect(screen.getByLabelText(/Extrusion amount X1 Carbon/i)).toBeInTheDocument();
+      expect(screen.getAllByText('Amount (mm)').length).toBeGreaterThan(0);
+      expect(screen.getAllByText('XY speed (mm/s)').length).toBeGreaterThan(0);
+      await waitFor(() => {
+        expect(screen.getAllByText('Temp chart').length).toBeGreaterThan(0);
+        expect(screen.getAllByLabelText('Temperature chart legend').length).toBeGreaterThan(0);
+        expect(screen.getAllByText('Time (s)').length).toBeGreaterThan(0);
+        expect(screen.getAllByText('°C').length).toBeGreaterThan(0);
+      });
+    });
+
+    it('sends an X/Y jog through the not-homed confirmation', async () => {
+      const user = userEvent.setup();
+      const jogRequests: Array<Record<string, string>> = [];
+
+      server.use(
+        http.get('/api/v1/printers/', () => {
+          return HttpResponse.json([mockPrinters[0]]);
+        }),
+        http.post('/api/v1/printers/:id/axis-jog', ({ request }) => {
+          const url = new URL(request.url);
+          jogRequests.push(Object.fromEntries(url.searchParams.entries()));
+          return HttpResponse.json({ success: true, message: 'Jog sent' });
+        })
+      );
+
+      render(<PrintersPage />);
+
+      await user.click(await screen.findByRole('button', { name: /Jog X1 Carbon/i }));
+      await user.click(await screen.findByRole('button', { name: /Move X\+ X1 Carbon/i }));
+      expect(await screen.findByText('Printer is not homed')).toBeInTheDocument();
+
+      await user.click(screen.getByRole('button', { name: 'Move anyway' }));
+
+      await waitFor(() => {
+        expect(jogRequests).toHaveLength(1);
+      });
+      expect(jogRequests[0]).toEqual({ axis: 'x', distance: '10', force: 'true', speed: '3000' });
+    });
+
+    it('does not send a nozzle target on load and keeps a missing target neutral', async () => {
+      const user = userEvent.setup();
+      const temperatureRequests: string[] = [];
+
+      server.use(
+        http.get('/api/v1/printers/:id/status', () => {
+          return HttpResponse.json({
+            ...mockPrinterStatus,
+            temperatures: { nozzle: 38, bed: 26, chamber: 25 },
+          });
+        }),
+        http.post('/api/v1/printers/:id/temperature', ({ request }) => {
+          temperatureRequests.push(request.url);
+          return HttpResponse.json({ success: true, message: 'Temperature set' });
+        })
+      );
+
+      render(<PrintersPage />);
+
+      await user.click(await screen.findByRole('button', { name: /Temperature X1 Carbon/i }));
+      expect((screen.getByLabelText('Nozzle target X1 Carbon') as HTMLInputElement).value).toBe('0');
+      expect(temperatureRequests).toHaveLength(0);
+    });
+
+    it('expands the temperature mini chart to the available dashboard width', async () => {
+      const prototype = HTMLDivElement.prototype;
+      const originalClientWidth = Object.getOwnPropertyDescriptor(prototype, 'clientWidth');
+      Object.defineProperty(prototype, 'clientWidth', { configurable: true, get: () => 960 });
+
+      try {
+        server.use(
+          http.get('/api/v1/printers/', () => {
+            return HttpResponse.json([mockPrinters[0]]);
+          })
+        );
+
+        render(<PrintersPage />);
+
+        const chart = await screen.findByRole('img', { name: 'Temperature chart' });
+        await waitFor(() => {
+          expect(chart).toHaveAttribute('viewBox', '0 0 960 78');
+        });
+      } finally {
+        if (originalClientWidth) {
+          Object.defineProperty(prototype, 'clientWidth', originalClientWidth);
+        } else {
+          Reflect.deleteProperty(prototype, 'clientWidth');
+        }
+      }
+    });
+
+    it('keeps firmware soft endstops enabled after dashboard homing', async () => {
+      const user = userEvent.setup();
+      const jogRequests: Array<Record<string, string>> = [];
+
+      server.use(
+        http.get('/api/v1/printers/', () => {
+          return HttpResponse.json([mockPrinters[0]]);
+        }),
+        http.post('/api/v1/printers/:id/home-axes', () => {
+          return HttpResponse.json({ success: true, message: 'Homing started' });
+        }),
+        http.post('/api/v1/printers/:id/axis-jog', ({ request }) => {
+          const url = new URL(request.url);
+          jogRequests.push(Object.fromEntries(url.searchParams.entries()));
+          return HttpResponse.json({ success: true, message: 'Jog sent' });
+        })
+      );
+
+      render(<PrintersPage />);
+
+      await user.click(await screen.findByRole('button', { name: /Jog X1 Carbon/i }));
+      await user.click(await screen.findByRole('button', { name: /Auto Home X1 Carbon/i }));
+      await waitFor(() => {
+        expect(sessionStorage.getItem('bambuddy.axisJog.homed.1')).toBe('1');
+      });
+
+      await user.click(screen.getByRole('button', { name: /Move X\+ X1 Carbon/i }));
+      await waitFor(() => {
+        expect(jogRequests).toHaveLength(1);
+      });
+      expect(jogRequests[0]).toEqual({ axis: 'x', distance: '10', force: 'false', speed: '3000' });
+    });
+
+    it('uses the A1 Mini workspace and center home position', async () => {
+      const user = userEvent.setup();
+      const a1Mini = { ...mockPrinters[0], id: 3, name: 'A1 Mini', model: 'A1 Mini' };
+      const jogRequests: Array<Record<string, string>> = [];
+
+      server.use(
+        http.get('/api/v1/printers/', () => {
+          return HttpResponse.json([a1Mini]);
+        }),
+        http.post('/api/v1/printers/:id/home-axes', () => {
+          return HttpResponse.json({ success: true, message: 'Homing started' });
+        }),
+        http.post('/api/v1/printers/:id/axis-jog', ({ request }) => {
+          const url = new URL(request.url);
+          jogRequests.push(Object.fromEntries(url.searchParams.entries()));
+          return HttpResponse.json({ success: true, message: 'Jog sent' });
+        })
+      );
+
+      render(<PrintersPage />);
+
+      await user.click(await screen.findByRole('button', { name: /Jog A1 Mini/i }));
+      expect(screen.getByText('workspace 180 x 180 x 180 mm')).toBeInTheDocument();
+      await user.click(screen.getByRole('button', { name: /Auto Home A1 Mini/i }));
+      expect(await screen.findByText('X 90 mm')).toBeInTheDocument();
+      expect(screen.getByText('Y 90 mm')).toBeInTheDocument();
+      expect(screen.getByText('Z 10 mm')).toBeInTheDocument();
+
+      await user.click(screen.getByRole('button', { name: '1 mm Step (mm)' }));
+      for (let requestCount = 1; requestCount <= 3; requestCount += 1) {
+        await user.click(screen.getByRole('button', { name: 'Move plate down A1 Mini' }));
+        await waitFor(() => {
+          expect(jogRequests).toHaveLength(requestCount);
+        });
+      }
+      expect(await screen.findByText('Z 7 mm')).toBeInTheDocument();
+    });
+
+    it('opens the temperature chart fullscreen and exposes hover values', async () => {
+      const user = userEvent.setup();
+      render(<PrintersPage />);
+
+      const openButtons = await screen.findAllByRole('button', { name: 'Open temperature chart fullscreen' });
+      await user.click(openButtons[0]);
+
+      expect(screen.getByRole('dialog', { name: 'Temperature chart fullscreen' })).toBeInTheDocument();
+      expect(screen.getByLabelText('Scrollable temperature history')).toBeInTheDocument();
+      const plot = screen.getByRole('img', { name: 'Temperature chart fullscreen plot' });
+      fireEvent.mouseMove(plot, { clientX: 10, clientY: 10 });
+      expect(await screen.findByLabelText('Temperature chart hover values')).toBeInTheDocument();
+      expect(screen.getAllByText('25°C').length).toBeGreaterThan(0);
+
+      fireEvent.keyDown(window, { key: 'Escape' });
+      expect(screen.queryByRole('dialog', { name: 'Temperature chart fullscreen' })).not.toBeInTheDocument();
     });
 
     it('shows plate clear status and action on finished printers when not cleared', async () => {

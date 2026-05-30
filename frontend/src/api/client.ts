@@ -475,6 +475,8 @@ export interface PrinterStatus {
   supports_drying: boolean;
 }
 
+export type TemperatureTarget = 'nozzle' | 'bed' | 'chamber';
+
 export interface PrinterCreate {
   name: string;
   serial_number: string;
@@ -3421,6 +3423,43 @@ export const api = {
       `/printers/${printerId}/home-axes?axes=${axes}`,
       { method: 'POST' }
     ),
+  axisJog: (
+    printerId: number,
+    axis: 'x' | 'y' | 'z',
+    distance: number,
+    force: boolean = false,
+    speed?: number,
+    limit?: number
+  ) => {
+    const params = new URLSearchParams({
+      axis,
+      distance: String(distance),
+      force: String(force),
+    });
+    if (speed !== undefined) params.set('speed', String(speed));
+    if (limit !== undefined) params.set('limit', String(limit));
+    return request<{ success: boolean; message: string }>(
+      `/printers/${printerId}/axis-jog?${params.toString()}`,
+      { method: 'POST' }
+    );
+  },
+  extrude: (printerId: number, amount: number, speed: number, force: boolean = false) =>
+    request<{ success: boolean; message: string }>(
+      `/printers/${printerId}/extrude?amount=${amount}&speed=${speed}&force=${force}`,
+      { method: 'POST' }
+    ),
+
+  setTemperature: (printerId: number, target: TemperatureTarget, temperature: number, nozzle: number = 0) => {
+    const params = new URLSearchParams({
+      target,
+      temperature: String(Math.round(temperature)),
+    });
+    if (target === 'nozzle') params.set('nozzle', String(nozzle));
+    return request<{ success: boolean; message: string }>(
+      `/printers/${printerId}/temperature?${params.toString()}`,
+      { method: 'POST' }
+    );
+  },
 
   // Chamber Light Control
   setChamberLight: (printerId: number, on: boolean) =>

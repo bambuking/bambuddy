@@ -1,4 +1,4 @@
-import { useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback } from 'react';
+import { useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback, type ChangeEvent, type MouseEvent as ReactMouseEvent } from 'react';
 import { compareFwVersions } from '../utils/firmwareVersion';
 import { formatPrintName } from '../utils/printName';
 import { computePopoverPosition } from '../utils/popoverPosition';
@@ -38,6 +38,8 @@ import {
   Pencil,
   ArrowUp,
   ArrowDown,
+  ArrowLeft,
+  ArrowRight,
   Layers,
   Video,
   Search,
@@ -64,7 +66,8 @@ import {
   Gauge,
   DoorOpen,
   DoorClosed,
-  MoveVertical,
+  Move,
+  Maximize2,
   LogIn,
   LogOut,
   MoreHorizontal,
@@ -75,7 +78,7 @@ import {
 import { useNavigate } from 'react-router-dom';
 import { api, discoveryApi, firmwareApi, withStreamToken, ApiError } from '../api/client';
 import { formatDateOnly, formatETA, formatDuration, parseUTCDate } from '../utils/date';
-import type { Printer, PrinterCreate, PrinterStatus, AMSUnit, DiscoveredPrinter, FirmwareUpdateInfo, FirmwareUploadStatus, LinkedSpoolInfo, SpoolAssignment, HMSError, InventorySpool, SmartPlug, PrinterDiagnosticResult } from '../api/client';
+import type { Printer, PrinterCreate, PrinterStatus, AMSUnit, DiscoveredPrinter, FirmwareUpdateInfo, FirmwareUploadStatus, LinkedSpoolInfo, SpoolAssignment, HMSError, InventorySpool, SmartPlug, PrinterDiagnosticResult, TemperatureTarget } from '../api/client';
 import { Card, CardContent } from '../components/Card';
 import { Button } from '../components/Button';
 import { ConfirmModal } from '../components/ConfirmModal';
@@ -109,6 +112,479 @@ export interface SpoolmanSlotAssignmentRow {
   ams_id: number;
   tray_id: number;
   spoolman_spool_id: number;
+}
+
+type JogAxis = 'x' | 'y' | 'z';
+type TemperatureSeriesKey = 'nozzle' | 'nozzle2' | 'bed' | 'chamber';
+type TemperatureSample = Record<TemperatureSeriesKey, number | null> & { time: number };
+type JogPosition = Record<JogAxis, number>;
+
+const JOG_LIMIT_MIN_MM = 1;
+const DEFAULT_JOG_LIMIT_MAX_MM = 200;
+const XY_JOG_SPEED_MIN_MM_S = 5;
+const XY_JOG_SPEED_MAX_MM_S = 200;
+const Z_JOG_SPEED_MIN_MM_S = 1;
+const Z_JOG_SPEED_MAX_MM_S = 20;
+const JOG_SPEED_MM_S_TO_FEEDRATE = 60;
+const EXTRUDE_AMOUNT_MIN_MM = 1;
+const EXTRUDE_AMOUNT_MAX_MM = 100;
+const EXTRUDE_SPEED_MIN = 30;
+const EXTRUDE_SPEED_MAX = 900;
+const EXTRUDE_MIN_TEMP_C = 170;
+const NOZZLE_TEMP_MAX_C = 320;
+const BED_TEMP_MAX_C = 120;
+const CHAMBER_TEMP_MAX_C = 70;
+const TEMP_HISTORY_SAMPLE_INTERVAL_MS = 2000;
+const TEMP_HISTORY_MIN_SAMPLE_GAP_MS = 900;
+const TEMP_HISTORY_MAX_SAMPLES = 3600;
+const TEMP_FULLSCREEN_POINT_SPACING_PX = 7;
+type PrinterMotionProfile = {
+  label: string;
+  travel: JogPosition;
+  homePosition?: JogPosition;
+  invertZPosition?: boolean;
+};
+const A1_MINI_MOTION_PROFILE: PrinterMotionProfile = {
+  label: '180 x 180 x 180 mm',
+  travel: { x: 180, y: 180, z: 180 },
+  homePosition: { x: 90, y: 90, z: 10 },
+  invertZPosition: true,
+};
+const LEGACY_A1_MOTION_PROFILE: PrinterMotionProfile = {
+  label: '180 x 180 x 180 mm',
+  travel: { x: 180, y: 180, z: 180 },
+};
+const STANDARD_MOTION_PROFILE: PrinterMotionProfile = {
+  label: '256 x 256 x 256 mm',
+  travel: { x: 256, y: 256, z: 256 },
+};
+const H2D_MOTION_PROFILE: PrinterMotionProfile = {
+  label: '325 x 320 x 325 mm',
+  travel: { x: 325, y: 320, z: 325 },
+};
+const PRINTER_MOTION_PROFILES: Record<string, PrinterMotionProfile> = {
+  A1MINI: A1_MINI_MOTION_PROFILE,
+  A12: A1_MINI_MOTION_PROFILE,
+  A04: A1_MINI_MOTION_PROFILE,
+  // These upstream legacy identifiers are ambiguous. Use the smaller envelope safely.
+  N1: LEGACY_A1_MOTION_PROFILE,
+  N2S: LEGACY_A1_MOTION_PROFILE,
+  A1: STANDARD_MOTION_PROFILE,
+  A11: STANDARD_MOTION_PROFILE,
+  X1: STANDARD_MOTION_PROFILE,
+  X1C: STANDARD_MOTION_PROFILE,
+  X1E: STANDARD_MOTION_PROFILE,
+  C11: STANDARD_MOTION_PROFILE,
+  C12: STANDARD_MOTION_PROFILE,
+  C13: STANDARD_MOTION_PROFILE,
+  P1: STANDARD_MOTION_PROFILE,
+  P1P: STANDARD_MOTION_PROFILE,
+  P1S: STANDARD_MOTION_PROFILE,
+  P2S: STANDARD_MOTION_PROFILE,
+  H2D: H2D_MOTION_PROFILE,
+  H2DPRO: H2D_MOTION_PROFILE,
+  O1D: H2D_MOTION_PROFILE,
+  O1E: H2D_MOTION_PROFILE,
+  O2D: H2D_MOTION_PROFILE,
+  H2C: { label: '305 x 320 x 325 mm', travel: { x: 305, y: 320, z: 325 } },
+  O1C: { label: '305 x 320 x 325 mm', travel: { x: 305, y: 320, z: 325 } },
+  O1C2: { label: '305 x 320 x 325 mm', travel: { x: 305, y: 320, z: 325 } },
+  H2S: { label: '340 x 320 x 340 mm', travel: { x: 340, y: 320, z: 340 } },
+  O1S: { label: '340 x 320 x 340 mm', travel: { x: 340, y: 320, z: 340 } },
+  X2D: { label: '256 x 256 x 260 mm', travel: { x: 256, y: 256, z: 260 } },
+  N6: { label: '256 x 256 x 260 mm', travel: { x: 256, y: 256, z: 260 } },
+};
+
+const clampNumber = (value: number, min: number, max: number): number => {
+  if (!Number.isFinite(value)) return min;
+  return Math.min(max, Math.max(min, value));
+};
+
+const maybeNumber = (value: unknown): number | null =>
+  typeof value === 'number' && Number.isFinite(value) ? value : null;
+
+const resolveMotionProfile = (model: string | null | undefined): PrinterMotionProfile | null => {
+  const normalized = (model ?? '').trim().toUpperCase().replace(/[\s-]/g, '');
+  return PRINTER_MOTION_PROFILES[normalized] ?? null;
+};
+
+const jogPositionDelta = (profile: PrinterMotionProfile, axis: JogAxis, distance: number): number =>
+  axis === 'z' && profile.invertZPosition ? -distance : distance;
+
+function TemperatureMiniChart({
+  samples,
+  labels,
+}: {
+  samples: TemperatureSample[];
+  labels: Record<TemperatureSeriesKey, string>;
+}) {
+  const [showFullscreen, setShowFullscreen] = useState(false);
+  const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
+  const miniChartContainerRef = useRef<HTMLDivElement>(null);
+  const fullscreenScrollRef = useRef<HTMLDivElement>(null);
+  const followLatestRef = useRef(true);
+  const [miniChartWidth, setMiniChartWidth] = useState(240);
+  const [fullscreenViewport, setFullscreenViewport] = useState({ width: 1120, height: 360 });
+  const hasSamples = samples.length > 0;
+
+  useLayoutEffect(() => {
+    const chartContainer = miniChartContainerRef.current;
+    if (!chartContainer) return;
+    const updateWidth = () => {
+      const nextWidth = Math.max(240, Math.round(chartContainer.clientWidth));
+      setMiniChartWidth((currentWidth) => currentWidth === nextWidth ? currentWidth : nextWidth);
+    };
+    updateWidth();
+    if (typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(updateWidth);
+    observer.observe(chartContainer);
+    return () => observer.disconnect();
+  }, [hasSamples]);
+
+  useEffect(() => {
+    if (!showFullscreen) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setShowFullscreen(false);
+    };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [showFullscreen]);
+
+  useLayoutEffect(() => {
+    const scrollContainer = fullscreenScrollRef.current;
+    if (!showFullscreen || !scrollContainer) return;
+    const updateViewport = () => {
+      const nextViewport = {
+        width: Math.max(320, Math.round(scrollContainer.clientWidth)),
+        height: Math.max(240, Math.round(scrollContainer.clientHeight)),
+      };
+      setFullscreenViewport((currentViewport) =>
+        currentViewport.width === nextViewport.width && currentViewport.height === nextViewport.height
+          ? currentViewport
+          : nextViewport
+      );
+    };
+    updateViewport();
+    if (typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(updateViewport);
+    observer.observe(scrollContainer);
+    return () => observer.disconnect();
+  }, [showFullscreen]);
+
+  useLayoutEffect(() => {
+    const scrollContainer = fullscreenScrollRef.current;
+    if (!showFullscreen || !scrollContainer || !followLatestRef.current) return;
+    scrollContainer.scrollLeft = scrollContainer.scrollWidth - scrollContainer.clientWidth;
+  }, [samples.length, showFullscreen]);
+
+  const allSeries: Array<{ key: TemperatureSeriesKey; label: string; color: string }> = [
+    { key: 'nozzle', label: labels.nozzle, color: '#fb923c' },
+    { key: 'nozzle2', label: labels.nozzle2, color: '#f59e0b' },
+    { key: 'bed', label: labels.bed, color: '#60a5fa' },
+    { key: 'chamber', label: labels.chamber, color: '#4ade80' },
+  ];
+  const series = allSeries.filter((item) => samples.some((sample) => sample[item.key] !== null));
+
+  if (!hasSamples || series.length === 0) return null;
+
+  const values = samples.flatMap((sample) =>
+    series.map((item) => sample[item.key]).filter((value): value is number => value !== null)
+  );
+  const low = Math.max(0, Math.floor(Math.min(...values) - 5));
+  const high = Math.max(low + 10, Math.ceil(Math.max(...values) + 5));
+  const range = high - low;
+  const width = miniChartWidth;
+  const height = 78;
+  const plotLeft = 27;
+  const plotRight = width - 4;
+  const plotTop = 5;
+  const plotBottom = height - 18;
+  const plotWidth = plotRight - plotLeft;
+  const plotHeight = plotBottom - plotTop;
+  const mid = low + range / 2;
+  const span = Math.max(1, samples.length - 1);
+  const elapsedSeconds = Math.max(0, Math.round((samples[samples.length - 1].time - samples[0].time) / 1000));
+
+  const chartPoint = (sample: TemperatureSample, index: number, key: TemperatureSeriesKey) => {
+    const value = sample[key];
+    if (value === null) return null;
+    const x = samples.length === 1 ? plotLeft + plotWidth / 2 : plotLeft + (index / span) * plotWidth;
+    const y = plotTop + ((high - value) / range) * plotHeight;
+    return { x, y };
+  };
+  const pointsFor = (key: TemperatureSeriesKey) =>
+    samples
+      .map((sample, index) => chartPoint(sample, index, key))
+      .filter((point): point is { x: number; y: number } => point !== null)
+      .map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`)
+      .join(' ');
+  const latestPointFor = (key: TemperatureSeriesKey) => {
+    for (let index = samples.length - 1; index >= 0; index -= 1) {
+      const point = chartPoint(samples[index], index, key);
+      if (point) return point;
+    }
+    return null;
+  };
+  const latestValueFor = (key: TemperatureSeriesKey) => {
+    for (let index = samples.length - 1; index >= 0; index -= 1) {
+      const value = samples[index][key];
+      if (value !== null) return value;
+    }
+    return null;
+  };
+  const fullscreenWidth = Math.max(fullscreenViewport.width, (samples.length - 1) * TEMP_FULLSCREEN_POINT_SPACING_PX + 84);
+  const fullscreenHeight = fullscreenViewport.height;
+  const fullscreenPlotLeft = 50;
+  const fullscreenPlotRight = fullscreenWidth - 18;
+  const fullscreenPlotTop = 16;
+  const fullscreenPlotBottom = fullscreenHeight - 38;
+  const fullscreenPlotWidth = fullscreenPlotRight - fullscreenPlotLeft;
+  const fullscreenPlotHeight = fullscreenPlotBottom - fullscreenPlotTop;
+  const hoveredSample = hoveredIndex === null ? null : samples[hoveredIndex];
+  const hoveredTimeAgoSeconds = hoveredSample
+    ? Math.max(0, Math.round((samples[samples.length - 1].time - hoveredSample.time) / 1000))
+    : null;
+  const fullscreenXForIndex = (index: number) => samples.length === 1
+    ? fullscreenPlotLeft + fullscreenPlotWidth / 2
+    : fullscreenPlotLeft + (index / span) * fullscreenPlotWidth;
+  const hoveredLeftPercent = hoveredIndex === null
+    ? 50
+    : clampNumber((fullscreenXForIndex(hoveredIndex) / fullscreenWidth) * 100, 8, 92);
+  const fullscreenTimeTicks = Array.from({ length: 6 }, (_, index) => {
+    const ratio = index / 5;
+    const sampleIndex = Math.round(ratio * (samples.length - 1));
+    const secondsAgo = Math.max(0, Math.round((samples[samples.length - 1].time - samples[sampleIndex].time) / 1000));
+    return {
+      x: fullscreenPlotLeft + ratio * fullscreenPlotWidth,
+      label: secondsAgo === 0 ? 'now' : `-${secondsAgo}s`,
+    };
+  });
+  const fullscreenPoint = (sample: TemperatureSample, index: number, key: TemperatureSeriesKey) => {
+    const value = sample[key];
+    if (value === null) return null;
+    const x = fullscreenXForIndex(index);
+    const y = fullscreenPlotTop + ((high - value) / range) * fullscreenPlotHeight;
+    return { x, y };
+  };
+  const fullscreenPointsFor = (key: TemperatureSeriesKey) =>
+    samples
+      .map((sample, index) => fullscreenPoint(sample, index, key))
+      .filter((point): point is { x: number; y: number } => point !== null)
+      .map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`)
+      .join(' ');
+  const handleFullscreenMouseMove = (event: ReactMouseEvent<SVGSVGElement>) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    const x = ((event.clientX - rect.left) / rect.width) * fullscreenWidth;
+    const index = Math.round(((x - fullscreenPlotLeft) / fullscreenPlotWidth) * span);
+    setHoveredIndex(clampNumber(index, 0, samples.length - 1));
+  };
+  const handleFullscreenScroll = () => {
+    const scrollContainer = fullscreenScrollRef.current;
+    if (!scrollContainer) return;
+    followLatestRef.current = scrollContainer.scrollWidth - scrollContainer.clientWidth - scrollContainer.scrollLeft < 32;
+  };
+
+  return (
+    <>
+    <div className="mt-2 rounded-lg border border-bambu-dark-tertiary/50 bg-bambu-dark/70 px-2 py-2">
+      <div className="mb-1 flex items-center justify-between gap-2">
+        <span className="text-[10px] font-medium uppercase tracking-wider text-bambu-gray">Temp chart</span>
+        <div className="flex items-center gap-1.5">
+          <span className="text-[10px] tabular-nums text-bambu-gray">{low}°-{high}°C</span>
+          <button
+            type="button"
+            onClick={() => {
+              followLatestRef.current = true;
+              setShowFullscreen(true);
+            }}
+            className="inline-flex h-6 w-6 items-center justify-center rounded-md text-bambu-gray transition-colors hover:bg-bambu-dark-tertiary hover:text-white"
+            aria-label="Open temperature chart fullscreen"
+            title="Open temperature chart fullscreen"
+          >
+            <Maximize2 className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      </div>
+      <div ref={miniChartContainerRef} className="w-full">
+      <svg viewBox={`0 0 ${width} ${height}`} className="h-20 w-full overflow-visible" role="img" aria-label="Temperature chart">
+        <line x1={plotLeft} y1={plotTop} x2={plotRight} y2={plotTop} stroke="rgba(148, 163, 184, 0.12)" strokeWidth="1" />
+        <line x1={plotLeft} y1={plotTop + plotHeight / 2} x2={plotRight} y2={plotTop + plotHeight / 2} stroke="rgba(148, 163, 184, 0.12)" strokeWidth="1" />
+        <line x1={plotLeft} y1={plotBottom} x2={plotRight} y2={plotBottom} stroke="rgba(148, 163, 184, 0.24)" strokeWidth="1" />
+        <line x1={plotLeft} y1={plotTop} x2={plotLeft} y2={plotBottom} stroke="rgba(148, 163, 184, 0.24)" strokeWidth="1" />
+        <text x="0" y="7" fill="rgba(148, 163, 184, 0.9)" fontSize="7">°C</text>
+        <text x={plotLeft - 3} y={plotTop + 3} textAnchor="end" fill="rgba(148, 163, 184, 0.72)" fontSize="7">{high}</text>
+        <text x={plotLeft - 3} y={plotTop + plotHeight / 2 + 3} textAnchor="end" fill="rgba(148, 163, 184, 0.72)" fontSize="7">{Math.round(mid)}</text>
+        <text x={plotLeft - 3} y={plotBottom + 3} textAnchor="end" fill="rgba(148, 163, 184, 0.72)" fontSize="7">{low}</text>
+        <text x={plotLeft} y={height - 7} fill="rgba(148, 163, 184, 0.72)" fontSize="7">-{elapsedSeconds}s</text>
+        <text x={plotRight} y={height - 7} textAnchor="end" fill="rgba(148, 163, 184, 0.72)" fontSize="7">now</text>
+        <text x={(plotLeft + plotRight) / 2} y={height - 1} textAnchor="middle" fill="rgba(148, 163, 184, 0.9)" fontSize="7">Time (s)</text>
+        {series.map((item) => {
+          const latestPoint = latestPointFor(item.key);
+          return (
+            <g key={item.key}>
+              <polyline
+                points={pointsFor(item.key)}
+                fill="none"
+                stroke={item.color}
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                vectorEffect="non-scaling-stroke"
+              />
+              {latestPoint && (
+                <circle cx={latestPoint.x} cy={latestPoint.y} r="2.4" fill={item.color} />
+              )}
+            </g>
+          );
+        })}
+      </svg>
+      </div>
+      <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1" aria-label="Temperature chart legend">
+        {series.map((item) => {
+          const latestValue = latestValueFor(item.key);
+          return (
+            <span key={item.key} className="inline-flex items-center gap-1 text-[10px] text-bambu-gray">
+              <span className="h-1.5 w-1.5 rounded-full" style={{ backgroundColor: item.color }} />
+              <span>{item.label}</span>
+              {latestValue !== null && (
+                <span className="tabular-nums text-bambu-gray-light">{Math.round(latestValue)}°C</span>
+              )}
+            </span>
+          );
+        })}
+      </div>
+    </div>
+    {showFullscreen && (
+      <div
+        className="fixed inset-0 z-[80] bg-black/80"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Temperature chart fullscreen"
+        onClick={() => setShowFullscreen(false)}
+      >
+        <div
+          className="flex h-full w-full flex-col overflow-hidden border border-bambu-dark-tertiary bg-bambu-dark-secondary shadow-2xl"
+          onClick={(event) => event.stopPropagation()}
+        >
+          <div className="flex flex-shrink-0 items-center justify-between gap-3 border-b border-bambu-dark-tertiary px-3 py-2">
+            <div className="flex min-w-0 items-center gap-3">
+              <h3 className="text-xs font-semibold uppercase tracking-wider text-white">Temperature</h3>
+              <span className="text-[11px] tabular-nums text-bambu-gray">{low}°-{high}°C</span>
+              <span className="hidden text-[11px] tabular-nums text-bambu-gray-light sm:inline">
+                {samples.length} samples · {elapsedSeconds}s
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setShowFullscreen(false)}
+              className="inline-flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-md text-bambu-gray transition-colors hover:bg-bambu-dark-tertiary hover:text-white"
+              aria-label="Close temperature chart fullscreen"
+              title="Close"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+
+          <div
+            ref={fullscreenScrollRef}
+            className="min-h-0 flex-1 overflow-x-auto overflow-y-hidden bg-bambu-dark/35"
+            onScroll={handleFullscreenScroll}
+            aria-label="Scrollable temperature history"
+          >
+            <div className="relative h-full" style={{ width: `${fullscreenWidth}px` }}>
+              <svg
+                viewBox={`0 0 ${fullscreenWidth} ${fullscreenHeight}`}
+                className="block h-full max-w-none"
+                style={{ width: `${fullscreenWidth}px` }}
+                role="img"
+                aria-label="Temperature chart fullscreen plot"
+                onMouseMove={handleFullscreenMouseMove}
+                onMouseLeave={() => setHoveredIndex(null)}
+              >
+                <line x1={fullscreenPlotLeft} y1={fullscreenPlotTop} x2={fullscreenPlotRight} y2={fullscreenPlotTop} stroke="rgba(148, 163, 184, 0.16)" strokeWidth="1" />
+                <line x1={fullscreenPlotLeft} y1={fullscreenPlotTop + fullscreenPlotHeight / 2} x2={fullscreenPlotRight} y2={fullscreenPlotTop + fullscreenPlotHeight / 2} stroke="rgba(148, 163, 184, 0.14)" strokeWidth="1" />
+                <line x1={fullscreenPlotLeft} y1={fullscreenPlotBottom} x2={fullscreenPlotRight} y2={fullscreenPlotBottom} stroke="rgba(148, 163, 184, 0.32)" strokeWidth="1" />
+                <line x1={fullscreenPlotLeft} y1={fullscreenPlotTop} x2={fullscreenPlotLeft} y2={fullscreenPlotBottom} stroke="rgba(148, 163, 184, 0.32)" strokeWidth="1" />
+                <text x="10" y="15" fill="rgba(148, 163, 184, 0.9)" fontSize="10">°C</text>
+                <text x={fullscreenPlotLeft - 7} y={fullscreenPlotTop + 4} textAnchor="end" fill="rgba(148, 163, 184, 0.78)" fontSize="10">{high}</text>
+                <text x={fullscreenPlotLeft - 7} y={fullscreenPlotTop + fullscreenPlotHeight / 2 + 4} textAnchor="end" fill="rgba(148, 163, 184, 0.78)" fontSize="10">{Math.round(mid)}</text>
+                <text x={fullscreenPlotLeft - 7} y={fullscreenPlotBottom + 4} textAnchor="end" fill="rgba(148, 163, 184, 0.78)" fontSize="10">{low}</text>
+                {fullscreenTimeTicks.map((tick) => (
+                  <text key={tick.x} x={tick.x} y={fullscreenHeight - 15} textAnchor="middle" fill="rgba(148, 163, 184, 0.78)" fontSize="10">
+                    {tick.label}
+                  </text>
+                ))}
+                <text x={(fullscreenPlotLeft + fullscreenPlotRight) / 2} y={fullscreenHeight - 2} textAnchor="middle" fill="rgba(148, 163, 184, 0.9)" fontSize="10">Time (s)</text>
+                {series.map((item) => (
+                  <polyline
+                    key={item.key}
+                    points={fullscreenPointsFor(item.key)}
+                    fill="none"
+                    stroke={item.color}
+                    strokeWidth="1.5"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    vectorEffect="non-scaling-stroke"
+                  />
+                ))}
+                {hoveredSample && hoveredIndex !== null && (
+                  <>
+                    <line
+                      x1={fullscreenXForIndex(hoveredIndex)}
+                      y1={fullscreenPlotTop}
+                      x2={fullscreenXForIndex(hoveredIndex)}
+                      y2={fullscreenPlotBottom}
+                      stroke="rgba(226, 232, 240, 0.65)"
+                      strokeWidth="1"
+                      strokeDasharray="5 5"
+                      vectorEffect="non-scaling-stroke"
+                    />
+                    {series.map((item) => {
+                      const point = fullscreenPoint(hoveredSample, hoveredIndex, item.key);
+                      return point ? <circle key={item.key} cx={point.x} cy={point.y} r="3" fill={item.color} /> : null;
+                    })}
+                  </>
+                )}
+              </svg>
+              {hoveredSample && (
+                <div
+                  className="pointer-events-none absolute top-2 min-w-[145px] -translate-x-1/2 rounded-md border border-bambu-dark-tertiary bg-bambu-dark/95 px-2.5 py-2 shadow-lg"
+                  style={{ left: `${hoveredLeftPercent}%` }}
+                  aria-label="Temperature chart hover values"
+                >
+                  <div className="mb-1.5 flex items-center justify-between gap-3 text-[11px] tabular-nums text-bambu-gray-light">
+                    <span>{new Date(hoveredSample.time).toLocaleTimeString()}</span>
+                    <span>{hoveredTimeAgoSeconds === 0 ? 'now' : `-${hoveredTimeAgoSeconds}s`}</span>
+                  </div>
+                  {series.map((item) => (
+                    <div key={item.key} className="flex items-center justify-between gap-4 text-xs">
+                      <span className="inline-flex items-center gap-1.5 text-bambu-gray">
+                        <span className="h-2 w-2 rounded-full" style={{ backgroundColor: item.color }} />
+                        {item.label}
+                      </span>
+                      <span className="tabular-nums text-white">
+                        {hoveredSample[item.key] === null ? '—' : `${Math.round(hoveredSample[item.key] as number)}°C`}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="flex flex-shrink-0 flex-wrap gap-x-4 gap-y-1 border-t border-bambu-dark-tertiary px-3 py-2" aria-label="Temperature chart fullscreen legend">
+            {series.map((item) => (
+              <span key={item.key} className="inline-flex items-center gap-1.5 text-xs text-bambu-gray">
+                <span className="h-2 w-2 rounded-full" style={{ backgroundColor: item.color }} />
+                <span>{item.label}</span>
+              </span>
+            ))}
+          </div>
+        </div>
+      </div>
+    )}
+    </>
+  );
 }
 
 // Color names resolve via getColorName() which reads the backend color_catalog
@@ -1492,6 +1968,10 @@ function PrinterCard({
   const navigate = useNavigate();
   const { showToast } = useToast();
   const { hasPermission } = useAuth();
+  const motionProfile = resolveMotionProfile(printer.model);
+  const maxJogLimit = motionProfile
+    ? Math.min(motionProfile.travel.x, motionProfile.travel.y, motionProfile.travel.z)
+    : DEFAULT_JOG_LIMIT_MAX_MM;
   const [showMenu, setShowMenu] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [deleteArchives, setDeleteArchives] = useState(true);
@@ -1506,9 +1986,18 @@ function PrinterCard({
   const [showPauseConfirm, setShowPauseConfirm] = useState(false);
   const [showSpeedMenu, setShowSpeedMenu] = useState<number | null>(null);
   const [showAirductMenu, setShowAirductMenu] = useState<number | null>(null);
-  const [showBedJogMenu, setShowBedJogMenu] = useState<number | null>(null);
   const [bedJogStep, setBedJogStep] = useState<number>(10);
-  const [showNotHomedModal, setShowNotHomedModal] = useState<null | { distance: number }>(null);
+  const [jogLimit, setJogLimit] = useState<number>(50);
+  const [xyJogSpeed, setXyJogSpeed] = useState<number>(50);
+  const [zJogSpeed, setZJogSpeed] = useState<number>(10);
+  const [extrudeAmount, setExtrudeAmount] = useState<number>(5);
+  const [extrudeSpeed, setExtrudeSpeed] = useState<number>(300);
+  const [nozzleTargetTemp, setNozzleTargetTemp] = useState<number>(0);
+  const [bedTargetTemp, setBedTargetTemp] = useState<number>(0);
+  const [chamberTargetTemp, setChamberTargetTemp] = useState<number>(0);
+  const [assumedJogPosition, setAssumedJogPosition] = useState<JogPosition | null>(null);
+  const [tempHistory, setTempHistory] = useState<TemperatureSample[]>([]);
+  const [showNotHomedModal, setShowNotHomedModal] = useState<null | { axis: JogAxis; distance: number }>(null);
   const [showResumeConfirm, setShowResumeConfirm] = useState(false);
   const [showSkipObjectsModal, setShowSkipObjectsModal] = useState(false);
   const [showUploadForPrint, setShowUploadForPrint] = useState(false);
@@ -1575,12 +2064,56 @@ function PrinterCard({
   const [editingRoi, setEditingRoi] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
   const [isSavingRoi, setIsSavingRoi] = useState(false);
   const [plateCheckLightWasOff, setPlateCheckLightWasOff] = useState(false);
+  const tempTargetsInitializedRef = useRef<number | null>(null);
+  const latestTemperaturesRef = useRef<PrinterStatus['temperatures'] | undefined>(undefined);
 
   const { data: status } = useQuery({
     queryKey: ['printerStatus', printer.id],
     queryFn: () => api.getPrinterStatus(printer.id),
     refetchInterval: 30000, // Fallback polling, WebSocket handles real-time
   });
+
+  useEffect(() => {
+    const temperatures = status?.temperatures;
+    if (!temperatures || tempTargetsInitializedRef.current === printer.id) return;
+
+    setNozzleTargetTemp(clampNumber(Math.round(temperatures.nozzle_target ?? 0), 0, NOZZLE_TEMP_MAX_C));
+    setBedTargetTemp(clampNumber(Math.round(temperatures.bed_target ?? 0), 0, BED_TEMP_MAX_C));
+    setChamberTargetTemp(clampNumber(Math.round(temperatures.chamber_target ?? 0), 0, CHAMBER_TEMP_MAX_C));
+    tempTargetsInitializedRef.current = printer.id;
+  }, [printer.id, status?.temperatures]);
+
+  const appendTemperatureSample = useCallback(() => {
+    const temperatures = latestTemperaturesRef.current;
+    if (!temperatures) return;
+
+    const nextSample: TemperatureSample = {
+      time: Date.now(),
+      nozzle: maybeNumber(temperatures.nozzle),
+      nozzle2: maybeNumber(temperatures.nozzle_2),
+      bed: maybeNumber(temperatures.bed),
+      chamber: maybeNumber(temperatures.chamber),
+    };
+    if ([nextSample.nozzle, nextSample.nozzle2, nextSample.bed, nextSample.chamber].every((value) => value === null)) {
+      return;
+    }
+
+    setTempHistory((previous) => {
+      const last = previous[previous.length - 1];
+      if (last && nextSample.time - last.time < TEMP_HISTORY_MIN_SAMPLE_GAP_MS) return previous;
+      return [...previous, nextSample].slice(-TEMP_HISTORY_MAX_SAMPLES);
+    });
+  }, []);
+
+  useEffect(() => {
+    latestTemperaturesRef.current = status?.temperatures;
+    appendTemperatureSample();
+  }, [appendTemperatureSample, status?.temperatures]);
+
+  useEffect(() => {
+    const interval = window.setInterval(appendTemperatureSample, TEMP_HISTORY_SAMPLE_INTERVAL_MS);
+    return () => window.clearInterval(interval);
+  }, [appendTemperatureSample, printer.id]);
 
   // Check for firmware updates (cached for 5 minutes, can be disabled in settings)
   const { data: firmwareInfo } = useQuery({
@@ -2029,9 +2562,63 @@ function PrinterCard({
     },
   });
 
-  const bedJogMutation = useMutation({
-    mutationFn: ({ distance, force }: { distance: number; force?: boolean }) =>
-      api.bedJog(printer.id, distance, force ?? false),
+  const axisJogMutation = useMutation({
+    mutationFn: ({
+      axis,
+      distance,
+      force,
+      speed,
+    }: {
+      axis: JogAxis;
+      distance: number;
+      force?: boolean;
+      speed: number;
+    }) => api.axisJog(printer.id, axis, distance, force ?? false, speed),
+    onSuccess: (_, variables) => {
+      setAssumedJogPosition((position) => {
+        if (!position || !motionProfile) return position;
+        const axisMax = motionProfile.travel[variables.axis];
+        const positionDelta = jogPositionDelta(motionProfile, variables.axis, variables.distance);
+        return {
+          ...position,
+          [variables.axis]: clampNumber(position[variables.axis] + positionDelta, 0, axisMax),
+        };
+      });
+    },
+    onError: (error: Error) =>
+      showToast(error.message || t('printers.toast.failedToSendCommand'), 'error'),
+  });
+
+  const extrudeMutation = useMutation({
+    mutationFn: ({ amount, speed }: { amount: number; speed: number }) =>
+      api.extrude(printer.id, amount, speed),
+    onError: (error: Error) =>
+      showToast(error.message || t('printers.toast.failedToSendCommand'), 'error'),
+  });
+
+  const setTemperatureMutation = useMutation({
+    mutationFn: ({
+      target,
+      temperature,
+      nozzle = 0,
+    }: {
+      target: TemperatureTarget;
+      temperature: number;
+      nozzle?: number;
+    }) => api.setTemperature(printer.id, target, temperature, nozzle),
+    onSuccess: (_, variables) => {
+      queryClient.setQueryData(['printerStatus', printer.id], (old: typeof status) => {
+        if (!old?.temperatures) return old;
+        return {
+          ...old,
+          temperatures: {
+            ...old.temperatures,
+            [`${variables.target}_target`]: variables.temperature,
+          },
+        };
+      });
+      showToast(`${variables.target} temperature set to ${variables.temperature}°C`);
+    },
     onError: (error: Error) =>
       showToast(error.message || t('printers.toast.failedToSendCommand'), 'error'),
   });
@@ -2039,16 +2626,48 @@ function PrinterCard({
   const homeAxesMutation = useMutation({
     mutationFn: (axes: 'z' | 'xy' | 'all') => api.homeAxes(printer.id, axes),
     onSuccess: () => {
-      // Flip the session-scoped "warned" flag so the next bed-jog click doesn't re-prompt
-      // the not-homed modal. The flag is the same one "Move anyway" sets; after a successful
-      // auto-home request the printer is (or will shortly be) in a known-homed state, so
-      // prompting again in the same session is noise — #1052 follow-up.
-      try { sessionStorage.setItem(`bambuddy.bedJog.warned.${printer.id}`, '1'); } catch { /* ignore */ }
+      // Keep soft endstops enabled after dashboard homing. Only an explicit
+      // one-shot "Move anyway" action is allowed to bypass them.
+      try { sessionStorage.setItem(`bambuddy.axisJog.homed.${printer.id}`, '1'); } catch { /* ignore */ }
+      setAssumedJogPosition(motionProfile?.homePosition ?? null);
       showToast(t('printers.bedJog.homingStarted'));
     },
     onError: (error: Error) =>
       showToast(error.message || t('printers.toast.failedToSendCommand'), 'error'),
   });
+
+  const runJog = (axis: JogAxis, distance: number, force = false) => {
+    if (assumedJogPosition && motionProfile) {
+      const axisMax = motionProfile.travel[axis];
+      const nextPosition = assumedJogPosition[axis] + jogPositionDelta(motionProfile, axis, distance);
+      if (nextPosition < 0 || nextPosition > axisMax) {
+        showToast(
+          `${axis.toUpperCase()} limit is 0-${axisMax} mm. Current: ${assumedJogPosition[axis]} mm.`,
+          'error'
+        );
+        return;
+      }
+    }
+
+    const speedMmS = axis === 'z'
+      ? clampNumber(zJogSpeed, Z_JOG_SPEED_MIN_MM_S, Z_JOG_SPEED_MAX_MM_S)
+      : clampNumber(xyJogSpeed, XY_JOG_SPEED_MIN_MM_S, XY_JOG_SPEED_MAX_MM_S);
+    const feedrate = Math.round(speedMmS * JOG_SPEED_MM_S_TO_FEEDRATE);
+    axisJogMutation.mutate({ axis, distance, force, speed: feedrate });
+  };
+
+  const requestAxisJog = (axis: JogAxis, distance: number) => {
+    const homed = (() => {
+      try { return sessionStorage.getItem(`bambuddy.axisJog.homed.${printer.id}`) === '1'; }
+      catch { return false; }
+    })();
+
+    if (homed) {
+      runJog(axis, distance);
+    } else {
+      setShowNotHomedModal({ axis, distance });
+    }
+  };
 
   // Plate detection setting mutation
   const plateDetectionMutation = useMutation({
@@ -3023,6 +3642,7 @@ function PrinterCard({
               const singleNozzleSlot = rightNozzleSlot || leftNozzleSlot;
 
               return (
+                <>
                 <div className="flex items-stretch gap-1.5 flex-wrap">
                   {/* Nozzle temp - combined for dual nozzle */}
                   <div className="text-center px-2 py-1.5 bg-bambu-dark rounded-lg flex-1 flex flex-col justify-center items-center">
@@ -3096,6 +3716,16 @@ function PrinterCard({
                     <NozzleRackCard slots={status.nozzle_rack} filamentInfo={filamentInfo} />
                   )}
                 </div>
+                <TemperatureMiniChart
+                  samples={tempHistory}
+                  labels={{
+                    nozzle: t('printers.temperatures.nozzle'),
+                    nozzle2: `${t('printers.temperatures.nozzle')} 2`,
+                    bed: t('printers.temperatures.bed'),
+                    chamber: t('printers.temperatures.chamber'),
+                  }}
+                />
+                </>
               );
             })()}
 
@@ -3128,6 +3758,64 @@ function PrinterCard({
               const partFan = status.cooling_fan_speed;
               const auxFan = status.big_fan1_speed;
               const chamberFan = status.big_fan2_speed;
+              const canControl = hasPermission('printers:control');
+              const isOffline = status.connected !== true;
+              const jogBusy = axisJogMutation.isPending || homeAxesMutation.isPending || extrudeMutation.isPending;
+              const motionDisabled = !canControl || isOffline || isPrinting || jogBusy;
+              const temperatureDisabled = !canControl || isOffline || setTemperatureMutation.isPending;
+              const disabledTitle = !canControl
+                ? t('printers.permission.noControl')
+                : isOffline
+                  ? t('printers.connection.offline')
+                  : isPrinting
+                    ? t('printers.bedJog.disabledWhilePrinting')
+                    : t('printers.bedJog.title');
+              const controlInputClass = 'mt-1 h-8 w-full rounded-md border border-bambu-dark-tertiary bg-bambu-dark-secondary px-2 text-xs tabular-nums text-white outline-none transition-colors focus:border-bambu-green disabled:opacity-50';
+              const jogButtonClass = (
+                activeTone = 'text-indigo-300 bg-indigo-500/10 border-indigo-400/20 hover:bg-indigo-500/20',
+                sizeClass = 'w-10',
+              ) =>
+                `h-10 ${sizeClass} rounded-md border flex items-center justify-center transition-colors touch-manipulation ${
+                  motionDisabled
+                    ? 'bg-bambu-dark border-bambu-dark-tertiary text-bambu-gray/40 cursor-not-allowed'
+                    : activeTone
+                }`;
+              const activeXySpeed = clampNumber(xyJogSpeed, XY_JOG_SPEED_MIN_MM_S, XY_JOG_SPEED_MAX_MM_S);
+              const activeZSpeed = clampNumber(zJogSpeed, Z_JOG_SPEED_MIN_MM_S, Z_JOG_SPEED_MAX_MM_S);
+              const activeExtrudeAmount = clampNumber(extrudeAmount, EXTRUDE_AMOUNT_MIN_MM, EXTRUDE_AMOUNT_MAX_MM);
+              const activeExtrudeSpeed = clampNumber(extrudeSpeed, EXTRUDE_SPEED_MIN, EXTRUDE_SPEED_MAX);
+              const activeNozzleTemp = status.temperatures
+                ? (status.temperatures.nozzle_2 !== undefined && status.active_extruder === 0
+                    ? status.temperatures.nozzle_2
+                    : status.temperatures.nozzle)
+                : undefined;
+              const activeBedTemp = status.temperatures?.bed;
+              const extrusionReady = typeof activeNozzleTemp === 'number' && activeNozzleTemp >= EXTRUDE_MIN_TEMP_C;
+              const extrusionDisabled = motionDisabled || !extrusionReady;
+              const extrusionTitle = motionDisabled
+                ? disabledTitle
+                : extrusionReady
+                  ? `Move filament ${activeExtrudeAmount} mm @ ${activeExtrudeSpeed} mm/min`
+                  : `Nozzle needs ${EXTRUDE_MIN_TEMP_C}°C`;
+              const activeNozzleTarget = clampNumber(nozzleTargetTemp, 0, NOZZLE_TEMP_MAX_C);
+              const activeBedTarget = clampNumber(bedTargetTemp, 0, BED_TEMP_MAX_C);
+              const activeChamberTarget = clampNumber(chamberTargetTemp, 0, CHAMBER_TEMP_MAX_C);
+              const hasChamberTemperature = status.temperatures?.chamber !== undefined || status.temperatures?.chamber_target !== undefined;
+              const handleNumberInput = (setter: (value: number) => void, min: number, max: number) =>
+                (event: ChangeEvent<HTMLInputElement>) => setter(clampNumber(Number(event.currentTarget.value), min, max));
+              const jogTitle = (label: string) => {
+                if (motionDisabled) return disabledTitle;
+                const speed = label.startsWith('Z') ? activeZSpeed : activeXySpeed;
+                return `${label} ${bedJogStep} mm @ ${speed} mm/s`;
+              };
+              const jogAxis = (axis: JogAxis, distance: number) => {
+                if (motionDisabled) return;
+                requestAxisJog(axis, distance);
+              };
+              const setTemperatureTarget = (target: TemperatureTarget, temperature: number) => {
+                const nozzle = target === 'nozzle' ? status.active_extruder ?? 0 : 0;
+                setTemperatureMutation.mutate({ target, temperature, nozzle });
+              };
 
               return (
                 <div className="mt-3">
@@ -3288,90 +3976,6 @@ function PrinterCard({
                       {/* Separator */}
                       <div className="w-px h-5 bg-bambu-gray/30" />
 
-                      {/* Bed Jog (Z-axis) — compact badge, popover holds the actual controls */}
-                      {(() => {
-                        const canControl = hasPermission('printers:control');
-                        const disabled = isPrinting || !canControl;
-                        const bambuIsPlateBelow = true; // positive Z moves plate away from nozzle
-                        const requestJog = (direction: 1 | -1) => {
-                          const signed = direction * bedJogStep * (bambuIsPlateBelow ? 1 : -1);
-                          const warnedKey = `bambuddy.bedJog.warned.${printer.id}`;
-                          const warned = (() => {
-                            try { return sessionStorage.getItem(warnedKey) === '1'; }
-                            catch { return false; }
-                          })();
-                          setShowBedJogMenu(null);
-                          if (warned) {
-                            bedJogMutation.mutate({ distance: signed, force: true });
-                          } else {
-                            setShowNotHomedModal({ distance: signed });
-                          }
-                        };
-                        return (
-                          <div className="relative">
-                            <button
-                              onClick={() => setShowBedJogMenu(showBedJogMenu === printer.id ? null : printer.id)}
-                              disabled={disabled}
-                              className={`flex items-center gap-1 px-1.5 py-1 rounded transition-colors ${
-                                disabled
-                                  ? 'bg-bambu-dark cursor-not-allowed'
-                                  : 'bg-indigo-500/10 hover:bg-indigo-500/20'
-                              }`}
-                              title={!canControl ? t('printers.permission.noControl') : isPrinting ? t('printers.bedJog.disabledWhilePrinting') : t('printers.bedJog.title')}
-                            >
-                              <MoveVertical className={`w-3.5 h-3.5 ${disabled ? 'text-bambu-gray/50' : 'text-indigo-400'}`} />
-                              <span className={`text-[10px] ${disabled ? 'text-bambu-gray/50' : 'text-indigo-400'}`}>
-                                {t('printers.bedJog.bed')}
-                              </span>
-                              <span className={`text-[10px] tabular-nums opacity-70 ${disabled ? 'text-bambu-gray/50' : 'text-indigo-400'}`}>
-                                {bedJogStep}mm
-                              </span>
-                            </button>
-                            {showBedJogMenu === printer.id && (
-                              <>
-                                <div className="fixed inset-0 z-40" onClick={() => setShowBedJogMenu(null)} />
-                                <div className="absolute bottom-full left-0 mb-1 z-50 bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-lg shadow-lg p-2 min-w-[140px]">
-                                  <div className="flex items-center justify-between gap-1 mb-2">
-                                    <button
-                                      onClick={() => requestJog(-1)}
-                                      className="flex-1 flex items-center justify-center py-1.5 rounded bg-indigo-500/15 hover:bg-indigo-500/30 text-indigo-300"
-                                      aria-label={t('printers.bedJog.up')}
-                                    >
-                                      <ArrowUp className="w-4 h-4" />
-                                    </button>
-                                    <button
-                                      onClick={() => requestJog(1)}
-                                      className="flex-1 flex items-center justify-center py-1.5 rounded bg-indigo-500/15 hover:bg-indigo-500/30 text-indigo-300"
-                                      aria-label={t('printers.bedJog.down')}
-                                    >
-                                      <ArrowDown className="w-4 h-4" />
-                                    </button>
-                                  </div>
-                                  <div className="text-[9px] uppercase tracking-wider text-bambu-gray/70 px-1 mb-1">
-                                    {t('printers.bedJog.step')}
-                                  </div>
-                                  <div className="flex gap-1">
-                                    {[1, 10, 50].map((step) => (
-                                      <button
-                                        key={step}
-                                        onClick={() => setBedJogStep(step)}
-                                        className={`flex-1 px-1 py-1 rounded text-[10px] transition-colors ${
-                                          bedJogStep === step
-                                            ? 'bg-bambu-green/20 text-bambu-green'
-                                            : 'bg-bambu-dark text-bambu-gray hover:bg-bambu-dark-tertiary'
-                                        }`}
-                                      >
-                                        {step}
-                                      </button>
-                                    ))}
-                                  </div>
-                                </div>
-                              </>
-                            )}
-                          </div>
-                        );
-                      })()}
-
                     </div>
 
                     {/* Right: Print Control Buttons */}
@@ -3413,6 +4017,335 @@ function PrinterCard({
                         {isPaused ? <Play className="w-3 h-3" /> : <Pause className="w-3 h-3" />}
                         {isPaused ? t('printers.resume') : t('printers.pause')}
                       </button>
+                    </div>
+                  </div>
+
+                  <div className="mt-3 space-y-3">
+                    <Collapsible
+                      ariaLabel={`Jog ${printer.name}`}
+                      className="rounded-lg border border-bambu-dark-tertiary/60 bg-bambu-dark/70 p-3"
+                      summary={(
+                        <div className="flex min-w-0 items-center gap-2">
+                          <Move className="h-3.5 w-3.5 flex-shrink-0 text-indigo-300" />
+                          <span className="text-[10px] font-medium uppercase tracking-wider text-bambu-gray">Jog</span>
+                        </div>
+                      )}
+                      summaryClassName="min-h-7"
+                    >
+                      <div className="mb-3 flex flex-wrap items-center gap-2">
+                        <div className="flex gap-1">
+                          {[1, 10, 50].map((step) => (
+                            <button
+                              key={step}
+                              type="button"
+                              aria-pressed={bedJogStep === step}
+                              aria-label={`${step} mm ${t('printers.bedJog.step')}`}
+                              onClick={() => setBedJogStep(step)}
+                              className={`h-7 min-w-8 rounded-md px-2 text-[10px] font-medium transition-colors ${
+                                bedJogStep === step
+                                  ? 'bg-bambu-green/20 text-bambu-green'
+                                  : 'bg-bambu-dark-tertiary/60 text-bambu-gray hover:text-white hover:bg-bambu-dark-tertiary'
+                              }`}
+                            >
+                              {step}
+                            </button>
+                          ))}
+                        </div>
+                        <div className="h-px flex-1 bg-bambu-dark-tertiary/40" />
+                        {motionProfile && (
+                          <span className="rounded-full bg-bambu-dark-tertiary/70 px-2 py-0.5 text-[10px] tabular-nums text-bambu-gray">
+                            workspace {motionProfile.label}
+                          </span>
+                        )}
+                      </div>
+
+                      <div className="flex flex-wrap items-start gap-3">
+                        <div className="grid flex-shrink-0 grid-cols-3 gap-1.5">
+                          <div className="h-10 w-10" />
+                          <button
+                            type="button"
+                            onClick={() => jogAxis('y', bedJogStep)}
+                            disabled={motionDisabled}
+                            aria-label={`${t('printers.axisJog.moveYPositive', 'Move Y+')} ${printer.name}`}
+                            title={jogTitle('Y+')}
+                            className={jogButtonClass()}
+                          >
+                            <ArrowUp className="h-4 w-4" />
+                          </button>
+                          <div className="h-10 w-10" />
+
+                          <button
+                            type="button"
+                            onClick={() => jogAxis('x', -bedJogStep)}
+                            disabled={motionDisabled}
+                            aria-label={`${t('printers.axisJog.moveXNegative', 'Move X-')} ${printer.name}`}
+                            title={jogTitle('X-')}
+                            className={jogButtonClass()}
+                          >
+                            <ArrowLeft className="h-4 w-4" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (!motionDisabled) homeAxesMutation.mutate('all');
+                            }}
+                            disabled={motionDisabled}
+                            aria-label={`${t('printers.bedJog.homeZ')} ${printer.name}`}
+                            title={motionDisabled ? disabledTitle : t('printers.bedJog.homeZ')}
+                            className={jogButtonClass('text-bambu-green bg-bambu-green/10 border-bambu-green/20 hover:bg-bambu-green/20')}
+                          >
+                            {homeAxesMutation.isPending ? (
+                              <Loader2 className="h-4 w-4 animate-spin" />
+                            ) : (
+                              <Home className="h-4 w-4" />
+                            )}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => jogAxis('x', bedJogStep)}
+                            disabled={motionDisabled}
+                            aria-label={`${t('printers.axisJog.moveXPositive', 'Move X+')} ${printer.name}`}
+                            title={jogTitle('X+')}
+                            className={jogButtonClass()}
+                          >
+                            <ArrowRight className="h-4 w-4" />
+                          </button>
+
+                          <div className="h-10 w-10" />
+                          <button
+                            type="button"
+                            onClick={() => jogAxis('y', -bedJogStep)}
+                            disabled={motionDisabled}
+                            aria-label={`${t('printers.axisJog.moveYNegative', 'Move Y-')} ${printer.name}`}
+                            title={jogTitle('Y-')}
+                            className={jogButtonClass()}
+                          >
+                            <ArrowDown className="h-4 w-4" />
+                          </button>
+                          <div className="h-10 w-10" />
+                        </div>
+
+                        <div className="grid min-w-[190px] flex-1 grid-cols-2 gap-2">
+                          <label className="min-w-0 text-[10px] uppercase tracking-wider text-bambu-gray">
+                            XY speed (mm/s)
+                            <input
+                              type="number"
+                              min={XY_JOG_SPEED_MIN_MM_S}
+                              max={XY_JOG_SPEED_MAX_MM_S}
+                              step={1}
+                              value={activeXySpeed}
+                              onChange={handleNumberInput(setXyJogSpeed, XY_JOG_SPEED_MIN_MM_S, XY_JOG_SPEED_MAX_MM_S)}
+                              className={controlInputClass}
+                              aria-label={`XY jog speed ${printer.name}`}
+                            />
+                          </label>
+                          <label className="min-w-0 text-[10px] uppercase tracking-wider text-bambu-gray">
+                            Z speed (mm/s)
+                            <input
+                              type="number"
+                              min={Z_JOG_SPEED_MIN_MM_S}
+                              max={Z_JOG_SPEED_MAX_MM_S}
+                              step={1}
+                              value={activeZSpeed}
+                              onChange={handleNumberInput(setZJogSpeed, Z_JOG_SPEED_MIN_MM_S, Z_JOG_SPEED_MAX_MM_S)}
+                              className={controlInputClass}
+                              aria-label={`Z jog speed ${printer.name}`}
+                            />
+                          </label>
+                        </div>
+
+                        <div className="flex flex-shrink-0 flex-row gap-1.5 sm:flex-col">
+                          <button
+                            type="button"
+                            onClick={() => jogAxis('z', -bedJogStep)}
+                            disabled={motionDisabled}
+                            aria-label={`${t('printers.bedJog.up')} ${printer.name}`}
+                            title={jogTitle('Z-')}
+                            className={`${jogButtonClass('text-blue-300 bg-blue-500/10 border-blue-400/20 hover:bg-blue-500/20', 'w-14')} gap-1`}
+                          >
+                            <ArrowUp className="h-3.5 w-3.5" />
+                            <span className="text-[10px] font-semibold">Z</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => jogAxis('z', bedJogStep)}
+                            disabled={motionDisabled}
+                            aria-label={`${t('printers.bedJog.down')} ${printer.name}`}
+                            title={jogTitle('Z+')}
+                            className={`${jogButtonClass('text-blue-300 bg-blue-500/10 border-blue-400/20 hover:bg-blue-500/20', 'w-14')} gap-1`}
+                          >
+                            <ArrowDown className="h-3.5 w-3.5" />
+                            <span className="text-[10px] font-semibold">Z</span>
+                          </button>
+                        </div>
+                      </div>
+
+                      {assumedJogPosition && motionProfile?.homePosition && (
+                        <div className="mt-3 flex flex-wrap items-center gap-2 rounded-md bg-bambu-dark-secondary/70 px-2 py-1.5 text-[10px] tabular-nums text-bambu-gray">
+                          <span className="uppercase tracking-wider">Position</span>
+                          <span className="text-white">X {Math.round(assumedJogPosition.x)} mm</span>
+                          <span className="text-white">Y {Math.round(assumedJogPosition.y)} mm</span>
+                          <span className="text-white">Z {Math.round(assumedJogPosition.z)} mm</span>
+                        </div>
+                      )}
+                    </Collapsible>
+
+                    <div className="grid gap-3">
+                      <Collapsible
+                        ariaLabel={`Temperature ${printer.name}`}
+                        className="rounded-lg border border-bambu-dark-tertiary/60 bg-bambu-dark/70 p-3"
+                        summary={(
+                          <div className="flex min-w-0 items-center gap-1.5">
+                            <HeaterThermometer className="h-4 w-3" color="text-orange-400" isHeating={status.temperatures?.nozzle_heating ?? false} />
+                            <span className="text-[10px] font-medium uppercase tracking-wider text-bambu-gray">Temperature</span>
+                            <span className="ml-auto flex gap-2 text-[10px] tabular-nums text-bambu-gray">
+                              <span>N {typeof activeNozzleTemp === 'number' ? `${Math.round(activeNozzleTemp)}°C` : '—'}</span>
+                              <span>B {typeof activeBedTemp === 'number' ? `${Math.round(activeBedTemp)}°C` : '—'}</span>
+                            </span>
+                          </div>
+                        )}
+                        summaryClassName="min-h-7"
+                      >
+                        <div className="grid gap-2">
+                          <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-2">
+                            <label className="min-w-0 text-[10px] uppercase tracking-wider text-bambu-gray">
+                              Nozzle (°C)
+                              <input
+                                type="number"
+                                min={0}
+                                max={NOZZLE_TEMP_MAX_C}
+                                step={1}
+                                value={activeNozzleTarget}
+                                onChange={handleNumberInput(setNozzleTargetTemp, 0, NOZZLE_TEMP_MAX_C)}
+                                className={controlInputClass}
+                                aria-label={`Nozzle target ${printer.name}`}
+                              />
+                            </label>
+                            <button
+                              type="button"
+                              onClick={() => setTemperatureTarget('nozzle', activeNozzleTarget)}
+                              disabled={temperatureDisabled}
+                              aria-label={`Set nozzle temperature ${printer.name}`}
+                              className="mt-4 inline-flex h-8 min-w-12 items-center justify-center rounded-md border border-orange-400/20 bg-orange-500/10 px-2 text-xs font-medium text-orange-300 transition-colors hover:bg-orange-500/20 disabled:cursor-not-allowed disabled:border-bambu-dark-tertiary disabled:bg-bambu-dark disabled:text-bambu-gray/40"
+                            >
+                              {setTemperatureMutation.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : 'Set'}
+                            </button>
+                          </div>
+                          <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-2">
+                            <label className="min-w-0 text-[10px] uppercase tracking-wider text-bambu-gray">
+                              Bed (°C)
+                              <input
+                                type="number"
+                                min={0}
+                                max={BED_TEMP_MAX_C}
+                                step={1}
+                                value={activeBedTarget}
+                                onChange={handleNumberInput(setBedTargetTemp, 0, BED_TEMP_MAX_C)}
+                                className={controlInputClass}
+                                aria-label={`Bed target ${printer.name}`}
+                              />
+                            </label>
+                            <button
+                              type="button"
+                              onClick={() => setTemperatureTarget('bed', activeBedTarget)}
+                              disabled={temperatureDisabled}
+                              aria-label={`Set bed temperature ${printer.name}`}
+                              className="mt-4 inline-flex h-8 min-w-12 items-center justify-center rounded-md border border-blue-400/20 bg-blue-500/10 px-2 text-xs font-medium text-blue-300 transition-colors hover:bg-blue-500/20 disabled:cursor-not-allowed disabled:border-bambu-dark-tertiary disabled:bg-bambu-dark disabled:text-bambu-gray/40"
+                            >
+                              {setTemperatureMutation.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : 'Set'}
+                            </button>
+                          </div>
+                          {hasChamberTemperature && (
+                            <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-2">
+                              <label className="min-w-0 text-[10px] uppercase tracking-wider text-bambu-gray">
+                                Chamber (°C)
+                                <input
+                                  type="number"
+                                  min={0}
+                                  max={CHAMBER_TEMP_MAX_C}
+                                  step={1}
+                                  value={activeChamberTarget}
+                                  onChange={handleNumberInput(setChamberTargetTemp, 0, CHAMBER_TEMP_MAX_C)}
+                                  className={controlInputClass}
+                                  aria-label={`Chamber target ${printer.name}`}
+                                />
+                              </label>
+                              <button
+                                type="button"
+                                onClick={() => setTemperatureTarget('chamber', activeChamberTarget)}
+                                disabled={temperatureDisabled}
+                                aria-label={`Set chamber temperature ${printer.name}`}
+                                className="mt-4 inline-flex h-8 min-w-12 items-center justify-center rounded-md border border-green-400/20 bg-green-500/10 px-2 text-xs font-medium text-green-300 transition-colors hover:bg-green-500/20 disabled:cursor-not-allowed disabled:border-bambu-dark-tertiary disabled:bg-bambu-dark disabled:text-bambu-gray/40"
+                              >
+                                {setTemperatureMutation.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : 'Set'}
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      </Collapsible>
+
+                      <Collapsible
+                        ariaLabel={`Extrusion ${printer.name}`}
+                        className="rounded-lg border border-bambu-dark-tertiary/60 bg-bambu-dark/70 p-3"
+                        summary={(
+                          <div className="flex min-w-0 items-center gap-1.5">
+                            <Flame className="h-3.5 w-3.5 text-orange-300" />
+                            <span className="text-[10px] font-medium uppercase tracking-wider text-bambu-gray">Extrusion</span>
+                          </div>
+                        )}
+                        summaryClassName="min-h-7"
+                      >
+                        <div className="grid grid-cols-2 gap-2">
+                          <label className="min-w-0 text-[10px] uppercase tracking-wider text-bambu-gray">
+                            Amount (mm)
+                            <input
+                              type="number"
+                              min={EXTRUDE_AMOUNT_MIN_MM}
+                              max={EXTRUDE_AMOUNT_MAX_MM}
+                              step={1}
+                              value={activeExtrudeAmount}
+                              onChange={handleNumberInput(setExtrudeAmount, EXTRUDE_AMOUNT_MIN_MM, EXTRUDE_AMOUNT_MAX_MM)}
+                              className={controlInputClass}
+                              aria-label={`Extrusion amount ${printer.name}`}
+                            />
+                          </label>
+                          <label className="min-w-0 text-[10px] uppercase tracking-wider text-bambu-gray">
+                            E speed (mm/min)
+                            <input
+                              type="number"
+                              min={EXTRUDE_SPEED_MIN}
+                              max={EXTRUDE_SPEED_MAX}
+                              step={10}
+                              value={activeExtrudeSpeed}
+                              onChange={handleNumberInput(setExtrudeSpeed, EXTRUDE_SPEED_MIN, EXTRUDE_SPEED_MAX)}
+                              className={controlInputClass}
+                              aria-label={`Extrusion speed ${printer.name}`}
+                            />
+                          </label>
+                          <button
+                            type="button"
+                            onClick={() => extrudeMutation.mutate({ amount: -activeExtrudeAmount, speed: activeExtrudeSpeed })}
+                            disabled={extrusionDisabled}
+                            aria-label={`Retract filament ${printer.name}`}
+                            title={extrusionTitle}
+                            className="inline-flex h-8 items-center justify-center gap-1 rounded-md border border-orange-400/20 bg-orange-500/10 px-2 text-xs font-medium text-orange-300 transition-colors hover:bg-orange-500/20 disabled:cursor-not-allowed disabled:border-bambu-dark-tertiary disabled:bg-bambu-dark disabled:text-bambu-gray/40"
+                          >
+                            <LogOut className="h-3.5 w-3.5" />
+                            Retract
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => extrudeMutation.mutate({ amount: activeExtrudeAmount, speed: activeExtrudeSpeed })}
+                            disabled={extrusionDisabled}
+                            aria-label={`Extrude filament ${printer.name}`}
+                            title={extrusionTitle}
+                            className="inline-flex h-8 items-center justify-center gap-1 rounded-md border border-bambu-green/20 bg-bambu-green/10 px-2 text-xs font-medium text-bambu-green transition-colors hover:bg-bambu-green/20 disabled:cursor-not-allowed disabled:border-bambu-dark-tertiary disabled:bg-bambu-dark disabled:text-bambu-gray/40"
+                          >
+                            <LogIn className="h-3.5 w-3.5" />
+                            Extrude
+                          </button>
+                        </div>
+                      </Collapsible>
                     </div>
                   </div>
                 </div>
@@ -4612,6 +5545,297 @@ function PrinterCard({
           </>
         )}
 
+        {false && viewMode === 'expanded' && (() => {
+          const canControl = hasPermission('printers:control');
+          const isPrinting = status?.state === 'RUNNING' || status?.state === 'PAUSE';
+          const isOffline = status?.connected !== true;
+          const jogBusy = axisJogMutation.isPending || homeAxesMutation.isPending || extrudeMutation.isPending;
+          const disabled = !canControl || isOffline || isPrinting || jogBusy;
+          const disabledTitle = !canControl
+            ? t('printers.permission.noControl')
+            : isOffline
+              ? t('printers.connection.offline')
+              : isPrinting
+                ? t('printers.bedJog.disabledWhilePrinting')
+                : t('printers.bedJog.title');
+          const jogButtonClass = (
+            activeTone = 'text-indigo-300 bg-indigo-500/10 border-indigo-400/20 hover:bg-indigo-500/20',
+            sizeClass = 'w-10',
+          ) =>
+            `h-10 ${sizeClass} rounded-md border flex items-center justify-center transition-colors touch-manipulation ${
+              disabled
+                ? 'bg-bambu-dark border-bambu-dark-tertiary text-bambu-gray/40 cursor-not-allowed'
+                : activeTone
+            }`;
+          const inputClass = 'mt-1 h-8 w-full rounded-md border border-bambu-dark-tertiary bg-bambu-dark-secondary px-2 text-xs tabular-nums text-white outline-none transition-colors focus:border-bambu-green disabled:opacity-50';
+          const activeJogLimit = clampNumber(jogLimit, JOG_LIMIT_MIN_MM, maxJogLimit);
+          const activeXySpeed = clampNumber(xyJogSpeed, XY_JOG_SPEED_MIN_MM_S, XY_JOG_SPEED_MAX_MM_S);
+          const activeZSpeed = clampNumber(zJogSpeed, Z_JOG_SPEED_MIN_MM_S, Z_JOG_SPEED_MAX_MM_S);
+          const activeExtrudeAmount = clampNumber(extrudeAmount, EXTRUDE_AMOUNT_MIN_MM, EXTRUDE_AMOUNT_MAX_MM);
+          const activeExtrudeSpeed = clampNumber(extrudeSpeed, EXTRUDE_SPEED_MIN, EXTRUDE_SPEED_MAX);
+          const activeNozzleTemp = 0;
+          const extrusionReady = typeof activeNozzleTemp === 'number' && activeNozzleTemp >= EXTRUDE_MIN_TEMP_C;
+          const extrusionDisabled = disabled || !extrusionReady;
+          const extrusionTitle = disabled
+            ? disabledTitle
+            : extrusionReady
+              ? `Move filament ${activeExtrudeAmount} mm @ ${activeExtrudeSpeed} mm/min`
+              : `Nozzle needs ${EXTRUDE_MIN_TEMP_C}°C`;
+          const handleNumberInput = (setter: (value: number) => void, min: number, max: number) =>
+            (event: ChangeEvent<HTMLInputElement>) => setter(clampNumber(Number(event.currentTarget.value), min, max));
+          const jogTitle = (label: string) => {
+            if (disabled) return disabledTitle;
+            const speed = label.startsWith('Z') ? activeZSpeed : activeXySpeed;
+            if (bedJogStep > activeJogLimit) {
+              return `${label} blocked: step ${bedJogStep} mm is above ${activeJogLimit} mm limit`;
+            }
+            return `${label} ${bedJogStep} mm @ ${speed} mm/s`;
+          };
+          const jogAxis = (axis: JogAxis, distance: number) => {
+            if (disabled) return;
+            requestAxisJog(axis, distance);
+          };
+
+          return (
+            <div className="mt-3 rounded-lg border border-bambu-dark-tertiary/60 bg-bambu-dark/70 p-3">
+              <div className="mb-3 flex flex-wrap items-center gap-2">
+                <div className="flex items-center gap-1.5">
+                  <Move className="h-3.5 w-3.5 text-indigo-300" />
+                  <span className="text-[10px] font-medium uppercase tracking-wider text-bambu-gray">
+                    Jog
+                  </span>
+                </div>
+                <span className="rounded-full bg-bambu-dark-tertiary/70 px-2 py-0.5 text-[10px] tabular-nums text-bambu-gray">
+                  {bedJogStep} mm
+                </span>
+                <div className="h-px flex-1 bg-bambu-dark-tertiary/40" />
+                <div className="flex gap-1">
+                  {[1, 10, 50].map((step) => (
+                    <button
+                      key={step}
+                      type="button"
+                      aria-pressed={bedJogStep === step}
+                      aria-label={`${step} mm ${t('printers.bedJog.step')}`}
+                      onClick={() => setBedJogStep(step)}
+                      className={`h-7 min-w-8 rounded-md px-2 text-[10px] font-medium transition-colors ${
+                        bedJogStep === step
+                          ? 'bg-bambu-green/20 text-bambu-green'
+                          : 'bg-bambu-dark-tertiary/60 text-bambu-gray hover:text-white hover:bg-bambu-dark-tertiary'
+                      }`}
+                    >
+                      {step}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="mb-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+                <label className="min-w-0 text-[10px] uppercase tracking-wider text-bambu-gray">
+                  Limit (mm)
+                  <input
+                    type="number"
+                    min={JOG_LIMIT_MIN_MM}
+                    max={maxJogLimit}
+                    step={1}
+                    value={activeJogLimit}
+                    onChange={handleNumberInput(setJogLimit, JOG_LIMIT_MIN_MM, maxJogLimit)}
+                    className={inputClass}
+                    aria-label={`Motion limit ${printer.name}`}
+                  />
+                </label>
+                <label className="min-w-0 text-[10px] uppercase tracking-wider text-bambu-gray">
+                  XY speed (mm/s)
+                  <input
+                    type="number"
+                    min={XY_JOG_SPEED_MIN_MM_S}
+                    max={XY_JOG_SPEED_MAX_MM_S}
+                    step={1}
+                    value={activeXySpeed}
+                    onChange={handleNumberInput(setXyJogSpeed, XY_JOG_SPEED_MIN_MM_S, XY_JOG_SPEED_MAX_MM_S)}
+                    className={inputClass}
+                    aria-label={`XY jog speed ${printer.name}`}
+                  />
+                </label>
+                <label className="min-w-0 text-[10px] uppercase tracking-wider text-bambu-gray">
+                  Z speed (mm/s)
+                  <input
+                    type="number"
+                    min={Z_JOG_SPEED_MIN_MM_S}
+                    max={Z_JOG_SPEED_MAX_MM_S}
+                    step={1}
+                    value={activeZSpeed}
+                    onChange={handleNumberInput(setZJogSpeed, Z_JOG_SPEED_MIN_MM_S, Z_JOG_SPEED_MAX_MM_S)}
+                    className={inputClass}
+                    aria-label={`Z jog speed ${printer.name}`}
+                  />
+                </label>
+                <div className="min-w-0 text-[10px] uppercase tracking-wider text-bambu-gray">
+                  Guard (mm)
+                  <div className="mt-1 flex h-8 items-center rounded-md border border-bambu-dark-tertiary bg-bambu-dark-secondary px-2 text-xs tabular-nums text-bambu-gray">
+                    blocks &gt; {activeJogLimit}
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-3">
+                <div className="grid grid-cols-3 gap-1.5">
+                  <div className="h-10 w-10" />
+                  <button
+                    type="button"
+                    onClick={() => jogAxis('y', bedJogStep)}
+                    disabled={disabled}
+                    aria-label={`${t('printers.axisJog.moveYPositive', 'Move Y+')} ${printer.name}`}
+                    title={jogTitle('Y+')}
+                    className={jogButtonClass()}
+                  >
+                    <ArrowUp className="h-4 w-4" />
+                  </button>
+                  <div className="h-10 w-10" />
+
+                  <button
+                    type="button"
+                    onClick={() => jogAxis('x', -bedJogStep)}
+                    disabled={disabled}
+                    aria-label={`${t('printers.axisJog.moveXNegative', 'Move X-')} ${printer.name}`}
+                    title={jogTitle('X-')}
+                    className={jogButtonClass()}
+                  >
+                    <ArrowLeft className="h-4 w-4" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!disabled) homeAxesMutation.mutate('all');
+                    }}
+                    disabled={disabled}
+                    aria-label={`${t('printers.bedJog.homeZ')} ${printer.name}`}
+                    title={disabled ? disabledTitle : t('printers.bedJog.homeZ')}
+                    className={jogButtonClass('text-bambu-green bg-bambu-green/10 border-bambu-green/20 hover:bg-bambu-green/20')}
+                  >
+                    {homeAxesMutation.isPending ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Home className="h-4 w-4" />
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => jogAxis('x', bedJogStep)}
+                    disabled={disabled}
+                    aria-label={`${t('printers.axisJog.moveXPositive', 'Move X+')} ${printer.name}`}
+                    title={jogTitle('X+')}
+                    className={jogButtonClass()}
+                  >
+                    <ArrowRight className="h-4 w-4" />
+                  </button>
+
+                  <div className="h-10 w-10" />
+                  <button
+                    type="button"
+                    onClick={() => jogAxis('y', -bedJogStep)}
+                    disabled={disabled}
+                    aria-label={`${t('printers.axisJog.moveYNegative', 'Move Y-')} ${printer.name}`}
+                    title={jogTitle('Y-')}
+                    className={jogButtonClass()}
+                  >
+                    <ArrowDown className="h-4 w-4" />
+                  </button>
+                  <div className="h-10 w-10" />
+                </div>
+
+                <div className="h-24 w-px bg-bambu-dark-tertiary/50" />
+
+                <div className="flex flex-col gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => jogAxis('z', -bedJogStep)}
+                    disabled={disabled}
+                    aria-label={`${t('printers.bedJog.up')} ${printer.name}`}
+                    title={jogTitle('Z-')}
+                    className={`${jogButtonClass('text-blue-300 bg-blue-500/10 border-blue-400/20 hover:bg-blue-500/20', 'w-14')} gap-1`}
+                  >
+                    <ArrowUp className="h-3.5 w-3.5" />
+                    <span className="text-[10px] font-semibold">Z</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => jogAxis('z', bedJogStep)}
+                    disabled={disabled}
+                    aria-label={`${t('printers.bedJog.down')} ${printer.name}`}
+                    title={jogTitle('Z+')}
+                    className={`${jogButtonClass('text-blue-300 bg-blue-500/10 border-blue-400/20 hover:bg-blue-500/20', 'w-14')} gap-1`}
+                  >
+                    <ArrowDown className="h-3.5 w-3.5" />
+                    <span className="text-[10px] font-semibold">Z</span>
+                  </button>
+                </div>
+              </div>
+
+              <div className="mt-3 border-t border-bambu-dark-tertiary/50 pt-3">
+                <div className="mb-2 flex items-center gap-1.5">
+                  <Flame className="h-3.5 w-3.5 text-orange-300" />
+                  <span className="text-[10px] font-medium uppercase tracking-wider text-bambu-gray">Extrusion</span>
+                  {typeof activeNozzleTemp === 'number' && (
+                    <span className="ml-auto text-[10px] tabular-nums text-bambu-gray">
+                      {Math.round(activeNozzleTemp)}°C
+                    </span>
+                  )}
+                </div>
+                <div className="grid grid-cols-2 gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto_auto]">
+                  <label className="min-w-0 text-[10px] uppercase tracking-wider text-bambu-gray">
+                    Amount (mm)
+                    <input
+                      type="number"
+                      min={EXTRUDE_AMOUNT_MIN_MM}
+                      max={EXTRUDE_AMOUNT_MAX_MM}
+                      step={1}
+                      value={activeExtrudeAmount}
+                      onChange={handleNumberInput(setExtrudeAmount, EXTRUDE_AMOUNT_MIN_MM, EXTRUDE_AMOUNT_MAX_MM)}
+                      className={inputClass}
+                      aria-label={`Extrusion amount ${printer.name}`}
+                    />
+                  </label>
+                  <label className="min-w-0 text-[10px] uppercase tracking-wider text-bambu-gray">
+                    E speed (mm/min)
+                    <input
+                      type="number"
+                      min={EXTRUDE_SPEED_MIN}
+                      max={EXTRUDE_SPEED_MAX}
+                      step={10}
+                      value={activeExtrudeSpeed}
+                      onChange={handleNumberInput(setExtrudeSpeed, EXTRUDE_SPEED_MIN, EXTRUDE_SPEED_MAX)}
+                      className={inputClass}
+                      aria-label={`Extrusion speed ${printer.name}`}
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => extrudeMutation.mutate({ amount: -activeExtrudeAmount, speed: activeExtrudeSpeed })}
+                    disabled={extrusionDisabled}
+                    aria-label={`Retract filament ${printer.name}`}
+                    title={extrusionTitle}
+                    className="mt-4 inline-flex h-8 items-center justify-center gap-1 rounded-md border border-orange-400/20 bg-orange-500/10 px-2 text-xs font-medium text-orange-300 transition-colors hover:bg-orange-500/20 disabled:cursor-not-allowed disabled:border-bambu-dark-tertiary disabled:bg-bambu-dark disabled:text-bambu-gray/40"
+                  >
+                    <LogOut className="h-3.5 w-3.5" />
+                    Retract
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => extrudeMutation.mutate({ amount: activeExtrudeAmount, speed: activeExtrudeSpeed })}
+                    disabled={extrusionDisabled}
+                    aria-label={`Extrude filament ${printer.name}`}
+                    title={extrusionTitle}
+                    className="mt-4 inline-flex h-8 items-center justify-center gap-1 rounded-md border border-bambu-green/20 bg-bambu-green/10 px-2 text-xs font-medium text-bambu-green transition-colors hover:bg-bambu-green/20 disabled:cursor-not-allowed disabled:border-bambu-dark-tertiary disabled:bg-bambu-dark disabled:text-bambu-gray/40"
+                  >
+                    <LogIn className="h-3.5 w-3.5" />
+                    Extrude
+                  </button>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
+
         {/* Smart Plug Controls - hidden in compact mode */}
         {smartPlug && viewMode === 'expanded' && (
           <div className="mt-4 pt-4 border-t border-bambu-dark-tertiary">
@@ -5299,9 +6523,8 @@ function PrinterCard({
               </button>
               <button
                 onClick={() => {
-                  const d = showNotHomedModal.distance;
-                  try { sessionStorage.setItem(`bambuddy.bedJog.warned.${printer.id}`, '1'); } catch { /* ignore */ }
-                  bedJogMutation.mutate({ distance: d, force: true });
+                  const { axis, distance } = showNotHomedModal;
+                  runJog(axis, distance, true);
                   setShowNotHomedModal(null);
                 }}
                 className="w-full px-3 py-2 rounded-lg text-xs font-medium bg-yellow-500/20 text-yellow-400 hover:bg-yellow-500/30 transition-colors"
