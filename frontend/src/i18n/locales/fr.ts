@@ -1428,6 +1428,7 @@ export default {
       twoFa: 'Authentification 2FA',
       oidc: 'SSO / OIDC',
       security: 'Sécurité',
+      motion: 'Limites des axes',
       spoolbuddy: 'SpoolBuddy',
     },
     ldap: {
@@ -2314,6 +2315,17 @@ export default {
     },
 
 
+    axisLimits: {
+      title: 'Limites des axes',
+      description: 'Ajustez la zone de sécurité utilisée par les commandes de déplacement du tableau de bord. Les valeurs par défaut correspondent aux spécifications Bambu Lab ; modifiez-les uniquement si votre installation exige des limites plus strictes.',
+      defaultEnvelope: 'Valeur Bambu Lab par défaut',
+      sharedNozzleEnvelope: 'Zone sûre commune à tous les modes de buse.',
+      custom: 'Personnalisé',
+      resetAll: 'Tout réinitialiser',
+      axisLimit: 'limite d’axe',
+      rangeHint: 'Les valeurs sont enregistrées en millimètres. Plage autorisée : 1-{{max}} mm.',
+      invalid: 'Saisissez une valeur comprise entre 1 et {{max}} mm pour chaque axe.',
+    },
     spoolbuddy: {
       infoTitle: 'Périphériques SpoolBuddy',
       infoBody: 'Les bornes SpoolBuddy s\'enregistrent automatiquement via heartbeat. Désinscrivez ici un appareil qui n\'est plus utilisé ou un doublon obsolète laissé par un crash du daemon.',

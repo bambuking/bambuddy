@@ -5,6 +5,7 @@ Tests:
   POST /api/v1/printers/{printer_id}/home-axes?axes=<z|xy|all>
 """
 
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -28,11 +29,20 @@ from backend.app.api.routes.printers import _axis_travel_mm
         ("H2D Pro", (325, 320, 325)),
         ("H2C", (305, 320, 325)),
         ("H2S", (340, 320, 340)),
-        ("X2D", (256, 256, 260)),
+        ("X2D", (235.5, 256, 256)),
+        ("N6", (235.5, 256, 256)),
+        ("N2S", (256, 256, 256)),
+        ("N7", (256, 256, 256)),
+        ("BL-P001", (256, 256, 256)),
     ],
 )
 def test_axis_travel_uses_supported_printer_profile(model: str, travel: tuple[int, int, int]):
     assert tuple(_axis_travel_mm(model, axis) for axis in ("x", "y", "z")) == travel
+
+
+def test_axis_travel_uses_configured_model_override_for_internal_alias():
+    overrides = json.dumps({"A1MINI": {"x": 170, "y": 171, "z": 172}})
+    assert tuple(_axis_travel_mm("N1", axis, overrides) for axis in ("x", "y", "z")) == (170, 171, 172)
 
 
 class TestBedJogAPI:
@@ -274,6 +284,19 @@ class TestAxisJogAPI:
             )
             assert response.status_code == 200
             assert "G1 X300.00 F3000" in mock_client.send_gcode.call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_axis_jog_respects_saved_model_override(self, async_client: AsyncClient, printer_factory):
+        printer = await printer_factory(name="A1-Mini-Test", model="A1 Mini")
+        response = await async_client.put(
+            "/api/v1/settings/",
+            json={"axis_travel_overrides": json.dumps({"A1MINI": {"x": 150, "y": 180, "z": 180}})},
+        )
+        assert response.status_code == 200
+
+        response = await async_client.post(f"/api/v1/printers/{printer.id}/axis-jog?axis=x&distance=151")
+        assert response.status_code == 400
+        assert "<= 150 mm" in response.json()["detail"]
 
     @pytest.mark.asyncio
     async def test_axis_jog_rejects_speed_outside_axis_range(self, async_client: AsyncClient, printer_factory):

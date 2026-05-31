@@ -116,6 +116,20 @@ describe('SettingsPage', () => {
       });
     });
 
+    it('shows configurable axis limits on the motion tab', async () => {
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+
+      await user.click(await screen.findByRole('button', { name: 'Axis Limits' }));
+
+      await waitFor(() => {
+        expect(screen.getAllByText('Axis Limits').length).toBeGreaterThan(1);
+        expect(screen.getByText('A1 Mini')).toBeInTheDocument();
+        expect(screen.getByText('H2C')).toBeInTheDocument();
+        expect(screen.getByLabelText('A1 Mini X axis limit')).toHaveValue(180);
+      });
+    });
+
     it('shows default printer setting', async () => {
       render(<SettingsPage />);
 

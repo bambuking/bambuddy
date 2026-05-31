@@ -3,6 +3,7 @@
 Tests the full request/response cycle for /api/v1/settings/ endpoints.
 """
 
+import json
 import os
 
 import pytest
@@ -86,6 +87,27 @@ class TestSettingsAPI:
 
         assert response.status_code == 200
         assert response.json()["time_format"] == "24h"
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_update_axis_travel_overrides(self, async_client: AsyncClient):
+        """Verify per-model motion safety overrides are persisted."""
+        overrides = json.dumps({"A1MINI": {"x": 170, "y": 171, "z": 172}})
+        response = await async_client.put("/api/v1/settings/", json={"axis_travel_overrides": overrides})
+
+        assert response.status_code == 200
+        assert response.json()["axis_travel_overrides"] == overrides
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_reject_invalid_axis_travel_overrides(self, async_client: AsyncClient):
+        """All three axes must be present and bounded."""
+        response = await async_client.put(
+            "/api/v1/settings/",
+            json={"axis_travel_overrides": json.dumps({"A1MINI": {"x": 170, "y": 171}})},
+        )
+
+        assert response.status_code == 422
 
     @pytest.mark.asyncio
     @pytest.mark.integration

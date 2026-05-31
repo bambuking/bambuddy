@@ -1428,6 +1428,7 @@ export default {
       twoFa: 'Autenticação 2FA',
       oidc: 'SSO / OIDC',
       security: 'Segurança',
+      motion: 'Limites dos eixos',
       spoolbuddy: 'SpoolBuddy',
     },
     ldap: {
@@ -2313,6 +2314,17 @@ export default {
     },
 
 
+    axisLimits: {
+      title: 'Limites dos eixos',
+      description: 'Ajuste a área de segurança usada pelos controles de movimento do painel. Os valores padrão correspondem às especificações da Bambu Lab; altere-os somente se a sua instalação exigir limites mais restritos.',
+      defaultEnvelope: 'Padrão da Bambu Lab',
+      sharedNozzleEnvelope: 'Área segura compartilhada para todos os modos de bico.',
+      custom: 'Personalizado',
+      resetAll: 'Redefinir tudo',
+      axisLimit: 'limite do eixo',
+      rangeHint: 'Os valores são salvos em milímetros. Intervalo permitido: 1-{{max}} mm.',
+      invalid: 'Digite um valor entre 1 e {{max}} mm para cada eixo.',
+    },
     spoolbuddy: {
       infoTitle: 'Dispositivos SpoolBuddy',
       infoBody: 'Os kiosks SpoolBuddy se registram automaticamente via heartbeat. Cancele o registro de um dispositivo aqui se não estiver mais em uso ou se um duplicado obsoleto foi deixado por uma falha do daemon.',

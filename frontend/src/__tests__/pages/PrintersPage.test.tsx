@@ -402,6 +402,27 @@ describe('PrintersPage', () => {
       expect(await screen.findByText('Z 7 mm')).toBeInTheDocument();
     });
 
+    it('uses saved axis travel overrides in the dashboard jog workspace', async () => {
+      const user = userEvent.setup();
+      const a1Mini = { ...mockPrinters[0], id: 3, name: 'A1 Mini', model: 'A1 Mini' };
+
+      server.use(
+        http.get('/api/v1/printers/', () => {
+          return HttpResponse.json([a1Mini]);
+        }),
+        http.get('/api/v1/settings/ui-preferences', () => {
+          return HttpResponse.json({
+            axis_travel_overrides: JSON.stringify({ A1MINI: { x: 170, y: 171, z: 172 } }),
+          });
+        })
+      );
+
+      render(<PrintersPage />);
+
+      await user.click(await screen.findByRole('button', { name: /Jog A1 Mini/i }));
+      expect(screen.getByText('workspace 170 x 171 x 172 mm')).toBeInTheDocument();
+    });
+
     it('opens the temperature chart fullscreen and exposes hover values', async () => {
       const user = userEvent.setup();
       render(<PrintersPage />);

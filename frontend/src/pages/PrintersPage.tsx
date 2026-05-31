@@ -102,6 +102,7 @@ import { PrintModal } from '../components/PrintModal';
 import { PrinterInfoModal } from '../components/PrinterInfoModal';
 import { getGlobalTrayId, getFillBarColor, getSpoolmanFillLevel, getFallbackSpoolTag, isBambuLabSpool } from '../utils/amsHelpers';
 import { getPrinterImage, getWifiStrength, filterCompatibleQueueItems } from '../utils/printer';
+import { jogPositionDelta, resolveMotionProfile, type JogAxis, type JogPosition } from '../utils/printerMotion';
 import { FilamentSlotCircle } from '../components/FilamentSlotCircle';
 import { Collapsible } from '../components/Collapsible';
 import { ConnectionDiagnosticModal, DiagnosticChecklist } from '../components/ConnectionDiagnostic';
@@ -114,10 +115,8 @@ export interface SpoolmanSlotAssignmentRow {
   spoolman_spool_id: number;
 }
 
-type JogAxis = 'x' | 'y' | 'z';
 type TemperatureSeriesKey = 'nozzle' | 'nozzle2' | 'bed' | 'chamber';
 type TemperatureSample = Record<TemperatureSeriesKey, number | null> & { time: number };
-type JogPosition = Record<JogAxis, number>;
 
 const JOG_LIMIT_MIN_MM = 1;
 const DEFAULT_JOG_LIMIT_MAX_MM = 200;
@@ -138,63 +137,6 @@ const TEMP_HISTORY_SAMPLE_INTERVAL_MS = 2000;
 const TEMP_HISTORY_MIN_SAMPLE_GAP_MS = 900;
 const TEMP_HISTORY_MAX_SAMPLES = 3600;
 const TEMP_FULLSCREEN_POINT_SPACING_PX = 7;
-type PrinterMotionProfile = {
-  label: string;
-  travel: JogPosition;
-  homePosition?: JogPosition;
-  invertZPosition?: boolean;
-};
-const A1_MINI_MOTION_PROFILE: PrinterMotionProfile = {
-  label: '180 x 180 x 180 mm',
-  travel: { x: 180, y: 180, z: 180 },
-  homePosition: { x: 90, y: 90, z: 10 },
-  invertZPosition: true,
-};
-const LEGACY_A1_MOTION_PROFILE: PrinterMotionProfile = {
-  label: '180 x 180 x 180 mm',
-  travel: { x: 180, y: 180, z: 180 },
-};
-const STANDARD_MOTION_PROFILE: PrinterMotionProfile = {
-  label: '256 x 256 x 256 mm',
-  travel: { x: 256, y: 256, z: 256 },
-};
-const H2D_MOTION_PROFILE: PrinterMotionProfile = {
-  label: '325 x 320 x 325 mm',
-  travel: { x: 325, y: 320, z: 325 },
-};
-const PRINTER_MOTION_PROFILES: Record<string, PrinterMotionProfile> = {
-  A1MINI: A1_MINI_MOTION_PROFILE,
-  A12: A1_MINI_MOTION_PROFILE,
-  A04: A1_MINI_MOTION_PROFILE,
-  // These upstream legacy identifiers are ambiguous. Use the smaller envelope safely.
-  N1: LEGACY_A1_MOTION_PROFILE,
-  N2S: LEGACY_A1_MOTION_PROFILE,
-  A1: STANDARD_MOTION_PROFILE,
-  A11: STANDARD_MOTION_PROFILE,
-  X1: STANDARD_MOTION_PROFILE,
-  X1C: STANDARD_MOTION_PROFILE,
-  X1E: STANDARD_MOTION_PROFILE,
-  C11: STANDARD_MOTION_PROFILE,
-  C12: STANDARD_MOTION_PROFILE,
-  C13: STANDARD_MOTION_PROFILE,
-  P1: STANDARD_MOTION_PROFILE,
-  P1P: STANDARD_MOTION_PROFILE,
-  P1S: STANDARD_MOTION_PROFILE,
-  P2S: STANDARD_MOTION_PROFILE,
-  H2D: H2D_MOTION_PROFILE,
-  H2DPRO: H2D_MOTION_PROFILE,
-  O1D: H2D_MOTION_PROFILE,
-  O1E: H2D_MOTION_PROFILE,
-  O2D: H2D_MOTION_PROFILE,
-  H2C: { label: '305 x 320 x 325 mm', travel: { x: 305, y: 320, z: 325 } },
-  O1C: { label: '305 x 320 x 325 mm', travel: { x: 305, y: 320, z: 325 } },
-  O1C2: { label: '305 x 320 x 325 mm', travel: { x: 305, y: 320, z: 325 } },
-  H2S: { label: '340 x 320 x 340 mm', travel: { x: 340, y: 320, z: 340 } },
-  O1S: { label: '340 x 320 x 340 mm', travel: { x: 340, y: 320, z: 340 } },
-  X2D: { label: '256 x 256 x 260 mm', travel: { x: 256, y: 256, z: 260 } },
-  N6: { label: '256 x 256 x 260 mm', travel: { x: 256, y: 256, z: 260 } },
-};
-
 const clampNumber = (value: number, min: number, max: number): number => {
   if (!Number.isFinite(value)) return min;
   return Math.min(max, Math.max(min, value));
@@ -202,14 +144,6 @@ const clampNumber = (value: number, min: number, max: number): number => {
 
 const maybeNumber = (value: unknown): number | null =>
   typeof value === 'number' && Number.isFinite(value) ? value : null;
-
-const resolveMotionProfile = (model: string | null | undefined): PrinterMotionProfile | null => {
-  const normalized = (model ?? '').trim().toUpperCase().replace(/[\s-]/g, '');
-  return PRINTER_MOTION_PROFILES[normalized] ?? null;
-};
-
-const jogPositionDelta = (profile: PrinterMotionProfile, axis: JogAxis, distance: number): number =>
-  axis === 'z' && profile.invertZPosition ? -distance : distance;
 
 function TemperatureMiniChart({
   samples,
@@ -1925,6 +1859,7 @@ function PrinterCard({
   onOpenEmbeddedCamera,
   checkPrinterFirmware = true,
   dryingPresets = DRYING_PRESETS,
+  axisTravelOverrides = '',
   requirePlateClear = false,
   selectionMode = false,
   isSelected = false,
@@ -1958,6 +1893,7 @@ function PrinterCard({
   onOpenEmbeddedCamera?: (printerId: number, printerName: string) => void;
   checkPrinterFirmware?: boolean;
   dryingPresets?: Record<string, { n3f: number; n3s: number; n3f_hours: number; n3s_hours: number }>;
+  axisTravelOverrides?: string;
   requirePlateClear?: boolean;
   selectionMode?: boolean;
   isSelected?: boolean;
@@ -1968,7 +1904,7 @@ function PrinterCard({
   const navigate = useNavigate();
   const { showToast } = useToast();
   const { hasPermission } = useAuth();
-  const motionProfile = resolveMotionProfile(printer.model);
+  const motionProfile = resolveMotionProfile(printer.model, axisTravelOverrides);
   const maxJogLimit = motionProfile
     ? Math.min(motionProfile.travel.x, motionProfile.travel.y, motionProfile.travel.z)
     : DEFAULT_JOG_LIMIT_MAX_MM;
@@ -8786,6 +8722,7 @@ export function PrintersPage() {
                       onOpenEmbeddedCamera={(id, name) => setEmbeddedCameraPrinters(prev => new Map(prev).set(id, { id, name }))}
                       checkPrinterFirmware={settings?.check_printer_firmware !== false}
                       dryingPresets={effectiveDryingPresets}
+                      axisTravelOverrides={settings?.axis_travel_overrides}
                       requirePlateClear={settings?.require_plate_clear === true}
                       selectionMode={selectionMode}
                       isSelected={selectedPrinterIds.has(printer.id)}
@@ -8830,6 +8767,7 @@ export function PrintersPage() {
               onOpenEmbeddedCamera={(id, name) => setEmbeddedCameraPrinters(prev => new Map(prev).set(id, { id, name }))}
               checkPrinterFirmware={settings?.check_printer_firmware !== false}
               dryingPresets={effectiveDryingPresets}
+              axisTravelOverrides={settings?.axis_travel_overrides}
               requirePlateClear={settings?.require_plate_clear === true}
               selectionMode={selectionMode}
               isSelected={selectedPrinterIds.has(printer.id)}

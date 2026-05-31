@@ -89,6 +89,10 @@ class AppSettings(BaseModel):
         default="",
         description="JSON: per-model G-code injection snippets {model: {start_gcode, end_gcode}}",
     )
+    axis_travel_overrides: str = Field(
+        default="",
+        description="JSON: optional per-model axis travel overrides {model: {x, y, z}} in millimeters",
+    )
 
     # Scheduled local backup (#884)
     local_backup_enabled: bool = Field(default=False, description="Enable scheduled local backups")
@@ -403,6 +407,7 @@ class AppSettingsUpdate(BaseModel):
     require_plate_clear: bool | None = None
     queue_shortest_first: bool | None = None
     gcode_snippets: str | None = None
+    axis_travel_overrides: str | None = None
     local_backup_enabled: bool | None = None
     local_backup_schedule: str | None = None
     local_backup_time: str | None = None
@@ -438,6 +443,29 @@ class AppSettingsUpdate(BaseModel):
             raise ValueError("gcode_snippets must be valid JSON or empty")
         if not isinstance(parsed, dict):
             raise ValueError("gcode_snippets must be a JSON object keyed by printer model")
+        return v
+
+    @field_validator("axis_travel_overrides")
+    @classmethod
+    def validate_axis_travel_overrides(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return v
+        try:
+            parsed = json.loads(v)
+        except json.JSONDecodeError:
+            raise ValueError("axis_travel_overrides must be valid JSON or empty")
+        if not isinstance(parsed, dict):
+            raise ValueError("axis_travel_overrides must be a JSON object keyed by printer model")
+        for model, limits in parsed.items():
+            if not isinstance(model, str) or not model.strip():
+                raise ValueError("axis_travel_overrides model keys must be non-empty strings")
+            if not isinstance(limits, dict) or set(limits) != {"x", "y", "z"}:
+                raise ValueError(f"axis_travel_overrides[{model!r}] must define x, y, and z")
+            for axis, value in limits.items():
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 1 or value > 1000:
+                    raise ValueError(
+                        f"axis_travel_overrides[{model!r}].{axis} must be a number between 1 and 1000 mm"
+                    )
         return v
 
     @field_validator("ldap_group_mapping")

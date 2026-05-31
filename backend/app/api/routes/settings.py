@@ -334,6 +334,7 @@ _UI_PREFERENCE_FIELDS: tuple[str, ...] = (
     "time_format",
     "date_format",
     "drying_presets",
+    "axis_travel_overrides",
     "ams_humidity_good",
     "ams_humidity_fair",
     "ams_temp_good",

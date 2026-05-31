@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import re
 import zipfile
@@ -14,6 +15,7 @@ from backend.app.core.database import get_db
 from backend.app.core.permissions import Permission
 from backend.app.models.ams_label import AmsLabel
 from backend.app.models.printer import Printer
+from backend.app.models.settings import Settings as AppSetting
 from backend.app.models.slot_preset import SlotPresetMapping
 from backend.app.schemas.printer import (
     AmsLabelBody,
@@ -2786,19 +2788,21 @@ async def set_chamber_light(
 
 
 DEFAULT_MAX_AXIS_JOG_DISTANCE_MM = 200
+AXIS_TRAVEL_OVERRIDE_SETTING_KEY = "axis_travel_overrides"
 PRINTER_AXIS_TRAVEL_MM = {
     "A1MINI": {"X": 180, "Y": 180, "Z": 180},
     "A12": {"X": 180, "Y": 180, "Z": 180},
     "A04": {"X": 180, "Y": 180, "Z": 180},
-    # These legacy identifiers are inconsistent across upstream payloads.
-    # The A1 Mini envelope is the conservative safe cap for either variant.
     "N1": {"X": 180, "Y": 180, "Z": 180},
-    "N2S": {"X": 180, "Y": 180, "Z": 180},
+    "N2S": {"X": 256, "Y": 256, "Z": 256},
     "A1": {"X": 256, "Y": 256, "Z": 256},
     "A11": {"X": 256, "Y": 256, "Z": 256},
     "X1": {"X": 256, "Y": 256, "Z": 256},
     "X1C": {"X": 256, "Y": 256, "Z": 256},
     "X1E": {"X": 256, "Y": 256, "Z": 256},
+    "BLP001": {"X": 256, "Y": 256, "Z": 256},
+    "BLP002": {"X": 256, "Y": 256, "Z": 256},
+    "BLP003": {"X": 256, "Y": 256, "Z": 256},
     "C11": {"X": 256, "Y": 256, "Z": 256},
     "C12": {"X": 256, "Y": 256, "Z": 256},
     "C13": {"X": 256, "Y": 256, "Z": 256},
@@ -2806,6 +2810,7 @@ PRINTER_AXIS_TRAVEL_MM = {
     "P1P": {"X": 256, "Y": 256, "Z": 256},
     "P1S": {"X": 256, "Y": 256, "Z": 256},
     "P2S": {"X": 256, "Y": 256, "Z": 256},
+    "N7": {"X": 256, "Y": 256, "Z": 256},
     "H2D": {"X": 325, "Y": 320, "Z": 325},
     "H2DPRO": {"X": 325, "Y": 320, "Z": 325},
     "O1D": {"X": 325, "Y": 320, "Z": 325},
@@ -2816,8 +2821,41 @@ PRINTER_AXIS_TRAVEL_MM = {
     "O1C2": {"X": 305, "Y": 320, "Z": 325},
     "H2S": {"X": 340, "Y": 320, "Z": 340},
     "O1S": {"X": 340, "Y": 320, "Z": 340},
-    "X2D": {"X": 256, "Y": 256, "Z": 260},
-    "N6": {"X": 256, "Y": 256, "Z": 260},
+    # X2D dashboard jog uses the intersection shared by all nozzle modes.
+    "X2D": {"X": 235.5, "Y": 256, "Z": 256},
+    "N6": {"X": 235.5, "Y": 256, "Z": 256},
+}
+PRINTER_AXIS_TRAVEL_OVERRIDE_KEYS = {
+    "A1MINI": "A1MINI",
+    "A12": "A1MINI",
+    "A04": "A1MINI",
+    "N1": "A1MINI",
+    "A1": "A1",
+    "A11": "A1",
+    "N2S": "A1",
+    "X1": "X1",
+    "BLP002": "X1",
+    "X1C": "X1C",
+    "BLP001": "X1C",
+    "X1E": "X1E",
+    "BLP003": "X1E",
+    "P1": "P1S",
+    "P1P": "P1P",
+    "P1S": "P1S",
+    "P2S": "P2S",
+    "N7": "P2S",
+    "H2D": "H2D",
+    "O1D": "H2D",
+    "H2DPRO": "H2DPRO",
+    "O1E": "H2DPRO",
+    "O2D": "H2DPRO",
+    "H2C": "H2C",
+    "O1C": "H2C",
+    "O1C2": "H2C",
+    "H2S": "H2S",
+    "O1S": "H2S",
+    "X2D": "X2D",
+    "N6": "X2D",
 }
 AXIS_JOG_DEFAULT_FEEDRATES = {"X": 3000, "Y": 3000, "Z": 600}
 AXIS_JOG_FEEDRATE_LIMITS = {
@@ -2837,9 +2875,45 @@ TEMPERATURE_TARGET_LIMITS_C = {
 }
 
 
-def _axis_travel_mm(printer_model: str | None, axis: str) -> float:
+def _axis_travel_overrides(raw_overrides: str | None) -> dict[str, dict[str, float]]:
+    if not raw_overrides:
+        return {}
+    try:
+        parsed = json.loads(raw_overrides)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+
+    valid: dict[str, dict[str, float]] = {}
+    for model, limits in parsed.items():
+        if not isinstance(model, str) or not isinstance(limits, dict):
+            continue
+        normalized_model = re.sub(r"[\s-]+", "", model.upper())
+        normalized_limits: dict[str, float] = {}
+        for axis in ("x", "y", "z"):
+            value = limits.get(axis)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 1 or value > 1000:
+                break
+            normalized_limits[axis.upper()] = float(value)
+        if len(normalized_limits) == 3:
+            valid[normalized_model] = normalized_limits
+    return valid
+
+
+def _axis_travel_mm(printer_model: str | None, axis: str, raw_overrides: str | None = None) -> float:
     normalized_model = re.sub(r"[\s-]+", "", (printer_model or "").upper())
+    overrides = _axis_travel_overrides(raw_overrides)
+    override_key = PRINTER_AXIS_TRAVEL_OVERRIDE_KEYS.get(normalized_model, normalized_model)
+    override = overrides.get(normalized_model) or overrides.get(override_key)
+    if override and axis.upper() in override:
+        return override[axis.upper()]
     return PRINTER_AXIS_TRAVEL_MM.get(normalized_model, {}).get(axis.upper(), DEFAULT_MAX_AXIS_JOG_DISTANCE_MM)
+
+
+async def _axis_travel_mm_for_db(db: AsyncSession, printer_model: str | None, axis: str) -> float:
+    result = await db.execute(select(AppSetting.value).where(AppSetting.key == AXIS_TRAVEL_OVERRIDE_SETTING_KEY))
+    return _axis_travel_mm(printer_model, axis, result.scalar_one_or_none())
 
 
 @router.post("/{printer_id}/temperature")
@@ -2973,7 +3047,7 @@ async def bed_jog(
     printer = result.scalar_one_or_none()
     if not printer:
         raise HTTPException(404, "Printer not found")
-    max_distance = _axis_travel_mm(printer.model, "z")
+    max_distance = await _axis_travel_mm_for_db(db, printer.model, "z")
     if distance == 0 or abs(distance) > max_distance:
         raise HTTPException(400, f"Distance must be non-zero and <= {max_distance:g} mm")
 
@@ -3011,7 +3085,7 @@ async def axis_jog(
     printer = result.scalar_one_or_none()
     if not printer:
         raise HTTPException(404, "Printer not found")
-    max_distance = _axis_travel_mm(printer.model, axis)
+    max_distance = await _axis_travel_mm_for_db(db, printer.model, axis)
     effective_limit = max_distance if limit is None else limit
     if effective_limit <= 0 or effective_limit > max_distance:
         raise HTTPException(400, f"Motion limit must be > 0 and <= {max_distance:g} mm")

@@ -1428,6 +1428,7 @@ export default {
       twoFa: 'Autenticazione 2FA',
       oidc: 'SSO / OIDC',
       security: 'Sicurezza',
+      motion: 'Limiti degli assi',
       spoolbuddy: 'SpoolBuddy',
     },
     ldap: {
@@ -2313,6 +2314,17 @@ export default {
     },
 
 
+    axisLimits: {
+      title: 'Limiti degli assi',
+      description: 'Regola l’area di sicurezza usata dai controlli di movimento nella dashboard. I valori predefiniti corrispondono alle specifiche Bambu Lab; modificali solo se la configurazione richiede limiti più restrittivi.',
+      defaultEnvelope: 'Valore predefinito Bambu Lab',
+      sharedNozzleEnvelope: 'Area sicura condivisa per tutte le modalità dell’ugello.',
+      custom: 'Personalizzato',
+      resetAll: 'Ripristina tutto',
+      axisLimit: 'limite asse',
+      rangeHint: 'I valori vengono salvati in millimetri. Intervallo consentito: 1-{{max}} mm.',
+      invalid: 'Inserisci un valore compreso tra 1 e {{max}} mm per ogni asse.',
+    },
     spoolbuddy: {
       infoTitle: 'Dispositivi SpoolBuddy',
       infoBody: 'I kiosk SpoolBuddy si registrano automaticamente tramite heartbeat. Annulla la registrazione qui se un dispositivo non è più in uso o se un duplicato obsoleto è rimasto dopo un crash del daemon.',

@@ -1051,6 +1051,7 @@ export interface AppSettings {
   ambient_drying_enabled: boolean;  // Auto-dry idle printers based on humidity regardless of queue
   drying_presets: string;  // JSON blob of drying presets per filament type
   gcode_snippets: string;  // JSON: per-model G-code injection snippets
+  axis_travel_overrides: string;  // JSON: optional per-model axis travel limits in mm
   // Scheduled local backup
   local_backup_enabled: boolean;
   local_backup_schedule: string;
@@ -4289,6 +4290,7 @@ export const api = {
       time_format?: 'system' | '12h' | '24h';
       date_format?: string;
       drying_presets?: string;
+      axis_travel_overrides?: string;
       ams_humidity_good?: number;
       ams_humidity_fair?: number;
       ams_temp_good?: number;
